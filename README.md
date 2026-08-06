@@ -1,10 +1,3 @@
-Gens-RFT (Rust File Transfer) est un excellent choix ! C'est percutant, professionnel et ça met immédiatement en valeur la technologie sous-jacente qui fait la force du projet.
-
-Voici un README.md complet, rédigé en anglais (comme c'est le standard pour les projets professionnels et open-source sur GitHub), conçu pour donner immédiatement une impression de sérieux et de maîtrise technique. Il met en avant l'aspect "administration système" et la gestion d'environnements virtualisés.
-
-Tu peux copier-coller ce bloc de code directement dans un fichier README.md à la racine de ton nouveau projet.
-
-Markdown
 # Gens-RFT 
 > **Rust File Transfer** — A modern, blazing-fast, and highly secure FTP/SFTP client built for the next generation of sysadmins and developers.
 
