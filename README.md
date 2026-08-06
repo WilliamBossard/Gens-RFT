@@ -21,7 +21,7 @@ Powered by **Rust** on the backend and **React/TailwindCSS** on the frontend, it
 - **Native Drag & Drop:** Seamless HTML5-powered drag-and-drop between your operating system and remote environments.
 - **Real-Time Log Console:** Monitor every command, connection status, and handshake directly in the app.
 
-## 🛠️ Technology Stack
+##  Technology Stack
 
 Gens-RFT uses the **Tauri** framework to bind a robust systems-programming backend with a flexible web frontend.
 
@@ -49,16 +49,6 @@ Run the application in development mode:
 
 Bash
 npm run tauri dev
- Project Roadmap
-[x] Phase 1: Initialize Tauri architecture and React/Tailwind frontend layout.
-
-[ ] Phase 2: Implement local file system explorer (Tree & List views).
-
-[ ] Phase 3: Integrate Rust ssh2 crate for core SFTP connection and authentication.
-
-[ ] Phase 4: Build the concurrent transfer queue system (Upload/Download).
-
-[ ] Phase 5: Add support for legacy FTP protocol.
 
 🔒 License
 This project is licensed under the MIT License - see the LICENSE file for details.
