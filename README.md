@@ -39,8 +39,8 @@ Make sure you have [Node.js](https://nodejs.org/) and [Rust](https://www.rust-la
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/yourusername/gens-rft.git](https://github.com/yourusername/gens-rft.git)
-   cd gens-rft
+   git clone https://github.com/WilliamBossard/Gens-RFT
+   cd Gens-RFT
 Install frontend dependencies:
 
 Bash
