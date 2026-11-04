@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "gens-rft",
-        "width": 800,
-        "height": 600
+        "title": "Gens-RFT",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "maximized": true,
+        "resizable": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {
