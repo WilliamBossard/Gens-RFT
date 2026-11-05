@@ -1,0 +1,48 @@
+﻿@import "tailwindcss";
+
+/* Indique à Windows et Chromium d'adapter les éléments natifs */
+:root {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+/* Style personnalisé des barres de défilement (Scrollbars) */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Mode Sombre */
+html.dark ::-webkit-scrollbar-track {
+  background: #09090b;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Mode Clair */
+html:not(.dark) ::-webkit-scrollbar-track {
+  background: #f4f4f5;
+}
+
+html:not(.dark) ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+html:not(.dark) ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
