@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import SshTerminal from "./SshTerminal";
 import DirectoryTree from "./DirectoryTree";
+import SiteManagerModal, { SiteProfile } from "./components/modals/SiteManagerModal";
+import { useTransferStore } from "./store/useTransferStore";
 import {
   Server,
   Folder,
@@ -48,7 +50,9 @@ import {
   FileCheck,
   FileEdit,
   Save,
-  Send
+  Send,
+  Archive,
+  FolderArchive
 } from "lucide-react";
 
 interface FileEntry {
@@ -68,38 +72,6 @@ interface TransferProgress {
   direction: "upload" | "download";
 }
 
-interface QueueItem {
-  id: string;
-  filename: string;
-  sourcePath: string;
-  destDir: string;
-  destFileName: string;
-  direction: "upload" | "download";
-  isDir: boolean;
-  status: "queued" | "running" | "done" | "error";
-  percent: number;
-  speed: string;
-  eta: string;
-  lastBytes: number;
-  lastTimestamp: number;
-  sessionId: string;
-}
-
-interface SiteProfile {
-  id: string;
-  name: string;
-  protocol: "SFTP" | "FTP";
-  host: string;
-  port: string;
-  authType: "password" | "key";
-  username: string;
-  password?: string;
-  keyPath?: string;
-  passphrase?: string;
-  lastRemotePath?: string;
-  lastLocalPath?: string;
-}
-
 interface TabSession {
   id: string;
   title: string;
@@ -115,6 +87,11 @@ interface TabSession {
 
 type SortField = "name" | "size";
 type SortOrder = "asc" | "desc";
+
+function isArchiveFile(name: string): boolean {
+  const n = name.toLowerCase();
+  return n.endsWith(".zip") || n.endsWith(".tar.gz") || n.endsWith(".tgz") || n.endsWith(".tar");
+}
 
 function isEditableTextFile(name: string): boolean {
   const ext = name.split(".").pop()?.toLowerCase() || "";
@@ -202,6 +179,18 @@ export default function App() {
     return localStorage.getItem("gens_rft_skip_cross_confirm") === "true";
   });
 
+  // Store Zustand
+  const {
+    queue,
+    addToQueue,
+    updateProgress,
+    markStatus,
+    clearDone,
+    cancelAll,
+    retryItem,
+    retryAllFailed,
+  } = useTransferStore();
+
   // Sessions / Onglets
   const [tabs, setTabs] = useState<TabSession[]>([
     {
@@ -226,7 +215,6 @@ export default function App() {
     [tabs, activeTabId]
   );
 
-  // Largeur ajustable entre le panneau local et distant (en %)
   const [localPaneWidth, setLocalPaneWidth] = useState(50);
   const [treeHeight, setTreeHeight] = useState(130);
   const [bottomHeight, setBottomHeight] = useState(180);
@@ -266,11 +254,10 @@ export default function App() {
   const [localSort, setLocalSort] = useState<{ field: SortField; order: SortOrder }>({ field: "name", order: "asc" });
   const [remoteSort, setRemoteSort] = useState<{ field: SortField; order: SortOrder }>({ field: "name", order: "asc" });
 
-  // Logs & scroll automatique
+  // Logs & scroll
   const [logs, setLogs] = useState<string[]>(["Gens-RFT initialisé."]);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const [activeBottomTab, setActiveBottomTab] = useState<"logs" | "queue" | "terminal">("logs");
-  const [queue, setQueue] = useState<QueueItem[]>([]);
   const [bottomOpen, setBottomOpen] = useState(true);
 
   // Modales
@@ -295,7 +282,6 @@ export default function App() {
 
   const [chmodModal, setChmodModal] = useState<{ path: string; name: string; octal: string } | null>(null);
 
-  // Modale confirmation inter-onglets
   const [crossTabModal, setCrossTabModal] = useState<{
     item: { entry: FileEntry; from: "local" | "remote" };
     targetTab: TabSession;
@@ -318,7 +304,7 @@ export default function App() {
     };
   } | null>(null);
 
-  // Éditeur de texte intégré
+  // Éditeur
   const [editorModal, setEditorModal] = useState<{
     path: string;
     filename: string;
@@ -338,19 +324,6 @@ export default function App() {
   const [sites, setSites] = useState<SiteProfile[]>(() => {
     const saved = localStorage.getItem("gens_rft_sites");
     return saved ? JSON.parse(saved) : [];
-  });
-  const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
-  const [siteForm, setSiteForm] = useState<SiteProfile>({
-    id: "",
-    name: "Nouveau serveur",
-    protocol: "SFTP",
-    host: "",
-    port: "22",
-    authType: "password",
-    username: "",
-    password: "",
-    keyPath: "",
-    passphrase: "",
   });
 
   const [contextMenu, setContextMenu] = useState<{
@@ -468,55 +441,13 @@ export default function App() {
   useEffect(() => {
     const unlisten = listen<TransferProgress>("transfer_progress", (event) => {
       const p = event.payload;
-      const now = Date.now();
-
-      setQueue((items) =>
-        items.map((item) => {
-          if (item.id !== p.transfer_id) return item;
-
-          const deltaSec = (now - item.lastTimestamp) / 1000;
-          let newSpeed = item.speed;
-          let newEta = item.eta;
-
-          if (deltaSec >= 0.25) {
-            const deltaBytes = Math.max(0, p.transferred - item.lastBytes);
-            const bytesPerSec = deltaBytes / deltaSec;
-
-            if (bytesPerSec > 1024 * 1024) {
-              newSpeed = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} Mo/s`;
-            } else if (bytesPerSec > 1024) {
-              newSpeed = `${(bytesPerSec / 1024).toFixed(0)} Ko/s`;
-            } else {
-              newSpeed = `${bytesPerSec.toFixed(0)} o/s`;
-            }
-
-            const remainingBytes = p.total > p.transferred ? p.total - p.transferred : 0;
-            if (bytesPerSec > 0 && remainingBytes > 0) {
-              const secondsLeft = Math.ceil(remainingBytes / bytesPerSec);
-              newEta = secondsLeft < 60 ? `${secondsLeft}s` : `${Math.floor(secondsLeft / 60)}m ${secondsLeft % 60}s`;
-            } else if (p.percent >= 100) {
-              newEta = "0s";
-            }
-
-            return {
-              ...item,
-              percent: p.percent,
-              speed: newSpeed,
-              eta: newEta,
-              lastBytes: p.transferred,
-              lastTimestamp: now,
-            };
-          }
-
-          return { ...item, percent: p.percent };
-        })
-      );
+      updateProgress(p.transfer_id, p.transferred, p.total, p.percent);
     });
 
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [updateProgress]);
 
   const concurrentLimit = parseInt(maxConcurrent) || 2;
   const runningCount = queue.filter((item) => item.status === "running").length;
@@ -527,9 +458,7 @@ export default function App() {
     const nextItem = queue.find((item) => item.status === "queued");
     if (!nextItem) return;
 
-    setQueue((items) =>
-      items.map((it) => (it.id === nextItem.id ? { ...it, status: "running" } : it))
-    );
+    markStatus(nextItem.id, "running");
 
     const executeTransfer = async () => {
       try {
@@ -556,20 +485,16 @@ export default function App() {
           loadLocalDirectory(currentPath);
         }
 
-        setQueue((items) =>
-          items.map((it) => (it.id === nextItem.id ? { ...it, status: "done", percent: 100 } : it))
-        );
+        markStatus(nextItem.id, "done");
         logMessage(`226 Transfert terminé : ${nextItem.filename}`);
       } catch (err) {
-        setQueue((items) =>
-          items.map((it) => (it.id === nextItem.id ? { ...it, status: "error" } : it))
-        );
+        markStatus(nextItem.id, "error");
         logMessage(`550 Échec de transfert (${nextItem.filename}) : ${err}`);
       }
     };
 
     executeTransfer();
-  }, [queue, runningCount, activeTab.remotePath, currentPath, concurrentLimit, activeTab.id]);
+  }, [queue, runningCount, activeTab.remotePath, currentPath, concurrentLimit, activeTab.id, markStatus]);
 
   const loadLocalDirectory = async (targetPath?: string) => {
     try {
@@ -852,46 +777,33 @@ export default function App() {
                 : `${filename} (copie)`;
           }
 
-          addTransferToQueue(finalName, sourcePath, destDir, direction, isDir, destSessionId);
+          addToQueue({
+            sessionId: destSessionId,
+            filename: finalName,
+            sourcePath,
+            destDir,
+            destFileName: finalName,
+            direction,
+            isDir,
+          });
+          setActiveBottomTab("queue");
+          setBottomOpen(true);
           setConflictModal(null);
         },
       });
     } else {
-      addTransferToQueue(filename, sourcePath, destDir, direction, isDir, destSessionId);
-    }
-  };
-
-  const addTransferToQueue = (
-    filename: string,
-    sourcePath: string,
-    destDir: string,
-    direction: "upload" | "download",
-    isDir: boolean,
-    targetSessionId?: string
-  ) => {
-    const newId = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    setQueue((prev) => [
-      ...prev,
-      {
-        id: newId,
-        sessionId: targetSessionId || activeTab.id,
+      addToQueue({
+        sessionId: destSessionId,
         filename,
         sourcePath,
         destDir,
         destFileName: filename,
         direction,
         isDir,
-        status: "queued",
-        percent: 0,
-        speed: "-- Mo/s",
-        eta: "--",
-        lastBytes: 0,
-        lastTimestamp: Date.now(),
-      },
-    ]);
-
-    setActiveBottomTab("queue");
-    setBottomOpen(true);
+      });
+      setActiveBottomTab("queue");
+      setBottomOpen(true);
+    }
   };
 
   const processedLocalFiles = useMemo(() => {
@@ -1069,7 +981,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Barre d'onglets (Multi-sessions avec glisser-déposer inter-onglets) */}
+      {/* Barre d'onglets (Multi-sessions) */}
       <div
         className={`flex items-center border-b px-2 gap-1 overflow-x-auto select-none ${
           isDark ? "border-neutral-800 bg-neutral-950 text-neutral-300" : "border-neutral-300 bg-neutral-200 text-neutral-800"
@@ -1174,7 +1086,7 @@ export default function App() {
         </button>
       </div>
 
-      {/* Main Split-Pane avec redimensionnement horizontal */}
+      {/* Main Split-Pane */}
       <div className="flex flex-1 overflow-hidden relative select-none">
         {/* Panneau Local */}
         <section
@@ -1275,7 +1187,7 @@ export default function App() {
                 )}
               </div>
 
-              {/* Barre de chemin Windows éditable */}
+              {/* Chemin éditable */}
               {isEditingLocalPath ? (
                 <input
                   type="text"
@@ -1492,7 +1404,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* Splitter vertical entre le panneau local et le panneau distant */}
+        {/* Splitter vertical */}
         <div
           onMouseDown={(e) => {
             const container = e.currentTarget.parentElement;
@@ -1631,7 +1543,7 @@ export default function App() {
                 )}
               </div>
 
-              {/* Barre de chemin distant éditable */}
+              {/* Chemin distant éditable */}
               {isEditingRemotePath ? (
                 <input
                   type="text"
@@ -1987,10 +1899,15 @@ export default function App() {
             {activeBottomTab === "queue" && (
               <>
                 <button
-                  onClick={() => {
-                    setQueue((items) => items.filter((it) => it.status === "running" || it.status === "queued"));
-                    logMessage("Opération : Historique des transferts nettoyé.");
-                  }}
+                  onClick={retryAllFailed}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-amber-400 hover:text-amber-300 cursor-pointer transition active:scale-95"
+                  title="Relancer tous les transferts échoués ou annulés"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Relancer échecs</span>
+                </button>
+                <button
+                  onClick={clearDone}
                   className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-neutral-400 hover:text-neutral-200 cursor-pointer transition active:scale-95"
                   title="Vider les transferts terminés"
                 >
@@ -1998,17 +1915,7 @@ export default function App() {
                   <span>Vider terminé</span>
                 </button>
                 <button
-                  onClick={async () => {
-                    await invoke("cancel_current_transfer");
-                    setQueue((items) =>
-                      items.map((it) =>
-                        it.status === "queued" || it.status === "running"
-                          ? { ...it, status: "error", speed: "Annulé" }
-                          : it
-                      )
-                    );
-                    logMessage("Opération : Tous les transferts ont été annulés.");
-                  }}
+                  onClick={cancelAll}
                   className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-rose-500 hover:text-rose-400 cursor-pointer transition active:scale-95"
                   title="Annuler tous les transferts"
                 >
@@ -2072,12 +1979,7 @@ export default function App() {
                             <span className="text-neutral-400">ETA: {item.eta}</span>
                             <span className="text-sky-500">{item.percent.toFixed(0)}%</span>
                             <button
-                              onClick={async () => {
-                                await invoke("cancel_current_transfer");
-                                setQueue((items) =>
-                                  items.map((it) => (it.id === item.id ? { ...it, status: "error", speed: "Annulé" } : it))
-                                );
-                              }}
+                              onClick={cancelAll}
                               className="px-2 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-[10px] text-white cursor-pointer transition active:scale-95"
                             >
                               Annuler
@@ -2086,7 +1988,19 @@ export default function App() {
                         )}
                         {item.status === "queued" && <span className="text-neutral-500">En attente...</span>}
                         {item.status === "done" && <span className="text-emerald-400">Terminé</span>}
-                        {item.status === "error" && <span className="text-rose-400">Erreur / Annulé</span>}
+                        {item.status === "error" && (
+                          <div className="flex items-center gap-2">
+                            <span className="text-rose-400">Échec</span>
+                            <button
+                              onClick={() => retryItem(item.id)}
+                              className="flex items-center gap-1 px-2 py-0.5 rounded bg-amber-600/80 hover:bg-amber-500 text-[10px] text-white cursor-pointer transition active:scale-95"
+                              title="Relancer ce transfert"
+                            >
+                              <RotateCcw className="h-2.5 w-2.5" />
+                              <span>Réessayer</span>
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))
@@ -2100,10 +2014,10 @@ export default function App() {
       {/* Menu contextuel Clic Droit */}
       {contextMenu && (
         <div
-          style={{ top: `${Math.min(window.innerHeight - 220, contextMenu.y)}px`, left: `${Math.min(window.innerWidth - 220, contextMenu.x)}px` }}
+          style={{ top: `${Math.min(window.innerHeight - 280, contextMenu.y)}px`, left: `${Math.min(window.innerWidth - 220, contextMenu.x)}px` }}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
-          className={`fixed z-[100] min-w-52 rounded-lg border py-1 shadow-2xl text-xs backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 ${
+          className={`fixed z-[100] min-w-56 rounded-lg border py-1 shadow-2xl text-xs backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 ${
             isDark ? "border-neutral-800 bg-neutral-900/95 text-neutral-200" : "border-neutral-300 bg-white/95 text-neutral-800"
           }`}
         >
@@ -2161,6 +2075,57 @@ export default function App() {
                   </button>
                 </>
               )}
+
+              {/* Compression / Décompression distante */}
+              {isArchiveFile(contextMenu.entry.name) ? (
+                <button
+                  onClick={async () => {
+                    const entry = contextMenu.entry;
+                    setContextMenu(null);
+                    logMessage(`Extraction distante de "${entry.name}"...`);
+                    try {
+                      await invoke("extract_remote", {
+                        sessionId: activeTab.id,
+                        parentDir: activeTab.remotePath,
+                        archiveName: entry.name,
+                      });
+                      logMessage(`Archive "${entry.name}" extraite.`);
+                      loadRemoteDirectory(activeTab.remotePath);
+                    } catch (err) {
+                      logMessage(`Échec extraction distante : ${err}`);
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer text-amber-400"
+                >
+                  <FolderArchive className="h-3.5 w-3.5" />
+                  <span>Décompresser ici</span>
+                </button>
+              ) : (
+                <button
+                  onClick={async () => {
+                    const entry = contextMenu.entry;
+                    setContextMenu(null);
+                    logMessage(`Compression de "${entry.name}" en tar.gz...`);
+                    try {
+                      const res = await invoke<string>("compress_remote", {
+                        sessionId: activeTab.id,
+                        parentDir: activeTab.remotePath,
+                        itemName: entry.name,
+                        format: "tar.gz",
+                      });
+                      logMessage(`Archive créée : ${res}`);
+                      loadRemoteDirectory(activeTab.remotePath);
+                    } catch (err) {
+                      logMessage(`Échec compression distante : ${err}`);
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
+                >
+                  <Archive className="h-3.5 w-3.5 text-amber-500" />
+                  <span>Compresser (.tar.gz)</span>
+                </button>
+              )}
+
               <button
                 onClick={() => {
                   checkAndEnqueueTransfer(contextMenu.entry.name, contextMenu.entry.path, currentPath, "download", contextMenu.entry.is_dir);
@@ -2207,16 +2172,59 @@ export default function App() {
               </button>
             </>
           ) : (
-            <button
-              onClick={() => {
-                checkAndEnqueueTransfer(contextMenu.entry.name, contextMenu.entry.path, activeTab.remotePath, "upload", contextMenu.entry.is_dir);
-                setContextMenu(null);
-              }}
-              className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-            >
-              <Upload className="h-3.5 w-3.5 text-sky-500" />
-              <span>Envoyer sur le serveur actif</span>
-            </button>
+            <>
+              {/* Compression / Décompression locale */}
+              {isArchiveFile(contextMenu.entry.name) ? (
+                <button
+                  onClick={async () => {
+                    const entry = contextMenu.entry;
+                    setContextMenu(null);
+                    logMessage(`Extraction locale de "${entry.name}"...`);
+                    try {
+                      await invoke("extract_local", { path: entry.path });
+                      logMessage(`Archive locale extraite.`);
+                      loadLocalDirectory(currentPath);
+                    } catch (err) {
+                      logMessage(`Erreur extraction locale : ${err}`);
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer text-amber-400"
+                >
+                  <FolderArchive className="h-3.5 w-3.5" />
+                  <span>Extraire ici (ZIP)</span>
+                </button>
+              ) : (
+                <button
+                  onClick={async () => {
+                    const entry = contextMenu.entry;
+                    setContextMenu(null);
+                    logMessage(`Compression locale de "${entry.name}"...`);
+                    try {
+                      const res = await invoke<string>("compress_local", { path: entry.path, format: "zip" });
+                      logMessage(`Archive créée : ${res}`);
+                      loadLocalDirectory(currentPath);
+                    } catch (err) {
+                      logMessage(`Erreur compression locale : ${err}`);
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
+                >
+                  <Archive className="h-3.5 w-3.5 text-amber-500" />
+                  <span>Compresser en .zip</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  checkAndEnqueueTransfer(contextMenu.entry.name, contextMenu.entry.path, activeTab.remotePath, "upload", contextMenu.entry.is_dir);
+                  setContextMenu(null);
+                }}
+                className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
+              >
+                <Upload className="h-3.5 w-3.5 text-sky-500" />
+                <span>Envoyer sur le serveur actif</span>
+              </button>
+            </>
           )}
 
           <div className="my-1 border-t border-neutral-500/20" />
@@ -2250,7 +2258,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Modale confirmation transfert inter-onglets */}
+      {/* Modale transfert inter-onglets */}
       {crossTabModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
           <div
@@ -2311,7 +2319,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Fenêtre de l'Éditeur de texte avec numéros de lignes synchronisés et Ctrl+F */}
+      {/* Éditeur de texte */}
       {editorModal && (
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in duration-150">
           <div
@@ -2377,7 +2385,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Barre flottante de recherche (Ctrl+F) */}
+            {/* Barre flottante de recherche */}
             {showEditorSearch && (
               <div className="flex items-center justify-between border-b px-3 py-1.5 bg-neutral-950/90 border-neutral-800 gap-2">
                 <div className="flex items-center gap-2 flex-1">
@@ -2458,7 +2466,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Zone code avec numéros de lignes synchronisés */}
+            {/* Zone code */}
             <div className="flex-1 bg-neutral-950 flex overflow-hidden font-mono text-xs relative">
               <div
                 ref={editorLineNumbersRef}
@@ -2521,6 +2529,31 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Modale Gestionnaire de sites (composant refactorisé) */}
+      <SiteManagerModal
+        isOpen={showSiteManager}
+        onClose={() => setShowSiteManager(false)}
+        sites={sites}
+        setSites={setSites}
+        onConnect={(site: SiteProfile) => {
+          handleConnectRequest(
+            site.protocol,
+            site.host,
+            site.port,
+            site.username,
+            site.authType,
+            site.password,
+            site.keyPath,
+            site.passphrase,
+            site.id,
+            site.lastRemotePath,
+            site.lastLocalPath
+          );
+        }}
+        isDark={isDark}
+        logMessage={logMessage}
+      />
 
       {/* Modale de bifurcation de connexion */}
       {tabPromptModal && (
@@ -2594,289 +2627,6 @@ export default function App() {
               >
                 Annuler
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modale Gestionnaire de sites */}
-      {showSiteManager && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`flex h-[520px] w-[750px] flex-col rounded-xl border shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center justify-between border-b border-neutral-500/20 px-4 py-3">
-              <span className="font-semibold text-sm flex items-center gap-2 text-sky-500">
-                <SlidersHorizontal className="h-4 w-4" />
-                Gestionnaire de sites
-              </span>
-              <button onClick={() => setShowSiteManager(false)} className="text-neutral-400 hover:text-neutral-200 cursor-pointer transition">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex flex-1 overflow-hidden">
-              <div
-                className={`w-56 border-r border-neutral-500/20 p-3 flex flex-col justify-between ${
-                  isDark ? "bg-neutral-950/40" : "bg-neutral-50"
-                }`}
-              >
-                <div className="space-y-1 overflow-y-auto">
-                  <div className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-                    Mes Serveurs
-                  </div>
-                  {sites.map((site) => (
-                    <div
-                      key={site.id}
-                      onClick={() => {
-                        setSelectedSiteId(site.id);
-                        setSiteForm(site);
-                      }}
-                      className={`flex items-center gap-2 px-2.5 py-1.5 rounded cursor-pointer text-xs transition ${
-                        selectedSiteId === site.id
-                          ? "bg-sky-600 text-white font-medium"
-                          : "hover:bg-neutral-500/10 text-neutral-400"
-                      }`}
-                    >
-                      <Server className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">{site.name}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="flex gap-2 pt-2 border-t border-neutral-500/20">
-                  <button
-                    onClick={() => {
-                      const newSite: SiteProfile = {
-                        id: Date.now().toString(),
-                        name: `Serveur ${sites.length + 1}`,
-                        protocol: "SFTP",
-                        host: "",
-                        port: "22",
-                        authType: "password",
-                        username: "",
-                        password: "",
-                      };
-                      setSites([...sites, newSite]);
-                      setSelectedSiteId(newSite.id);
-                      setSiteForm(newSite);
-                    }}
-                    className="flex flex-1 items-center justify-center gap-1 py-1.5 rounded border border-neutral-700 hover:bg-neutral-500/10 text-xs cursor-pointer transition active:scale-95"
-                  >
-                    <Plus className="h-3 w-3" /> Nouveau
-                  </button>
-                  {selectedSiteId && (
-                    <button
-                      onClick={() => {
-                        setSites(sites.filter((s) => s.id !== selectedSiteId));
-                        setSelectedSiteId(null);
-                      }}
-                      className="px-2 py-1.5 rounded border border-rose-500/30 text-rose-500 hover:bg-rose-500/10 text-xs cursor-pointer transition active:scale-95"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex-1 p-5 overflow-y-auto space-y-4 text-xs">
-                {selectedSiteId ? (
-                  <>
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-neutral-400 mb-1">Nom du profil</label>
-                        <input
-                          type="text"
-                          value={siteForm.name}
-                          onChange={(e) => setSiteForm({ ...siteForm, name: e.target.value })}
-                          className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                            isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                          }`}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-neutral-400 mb-1">Protocole</label>
-                        <select
-                          value={siteForm.protocol}
-                          onChange={(e) =>
-                            setSiteForm({
-                              ...siteForm,
-                              protocol: e.target.value as "SFTP" | "FTP",
-                              port: e.target.value === "SFTP" ? "22" : "21",
-                            })
-                          }
-                          className={`w-full rounded border px-3 py-1.5 focus:outline-none cursor-pointer transition ${
-                            isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                          }`}
-                        >
-                          <option value="SFTP">SFTP - SSH File Transfer</option>
-                          <option value="FTP">FTP - File Transfer Protocol</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-4">
-                      <div className="col-span-2">
-                        <label className="block text-neutral-400 mb-1">Hôte / IP</label>
-                        <input
-                          type="text"
-                          placeholder="192.168.1.100 ou sftp.domaine.com"
-                          value={siteForm.host}
-                          onChange={(e) => setSiteForm({ ...siteForm, host: e.target.value })}
-                          className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                            isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                          }`}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-neutral-400 mb-1">Port</label>
-                        <input
-                          type="text"
-                          value={siteForm.port}
-                          onChange={(e) => setSiteForm({ ...siteForm, port: e.target.value })}
-                          className={`w-full rounded border px-3 py-1.5 text-center focus:outline-none transition ${
-                            isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                          }`}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="border-t border-neutral-500/20 pt-3">
-                      <label className="block text-neutral-400 mb-2 font-medium">Type d'authentification</label>
-                      <div className="flex gap-4 mb-3">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="auth"
-                            checked={siteForm.authType === "password"}
-                            onChange={() => setSiteForm({ ...siteForm, authType: "password" })}
-                            className="cursor-pointer"
-                          />
-                          <span>Mot de passe</span>
-                        </label>
-                        {siteForm.protocol === "SFTP" && (
-                          <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                              type="radio"
-                              name="auth"
-                              checked={siteForm.authType === "key"}
-                              onChange={() => setSiteForm({ ...siteForm, authType: "key" })}
-                              className="cursor-pointer"
-                            />
-                            <span>Clé SSH privée</span>
-                          </label>
-                        )}
-                      </div>
-
-                      <div className="space-y-3">
-                        <div>
-                          <label className="block text-neutral-400 mb-1">Nom d'utilisateur</label>
-                          <input
-                            type="text"
-                            placeholder="root"
-                            value={siteForm.username}
-                            onChange={(e) => setSiteForm({ ...siteForm, username: e.target.value })}
-                            className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                              isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                            }`}
-                          />
-                        </div>
-
-                        {siteForm.authType === "password" ? (
-                          <div>
-                            <label className="block text-neutral-400 mb-1">Mot de passe</label>
-                            <input
-                              type="password"
-                              value={siteForm.password || ""}
-                              onChange={(e) => setSiteForm({ ...siteForm, password: e.target.value })}
-                              className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                                isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                              }`}
-                            />
-                          </div>
-                        ) : (
-                          <>
-                            <div>
-                              <label className="block text-neutral-400 mb-1">Chemin de la clé privée</label>
-                              <input
-                                type="text"
-                                placeholder="C:\Users\William\.ssh\id_ed25519"
-                                value={siteForm.keyPath || ""}
-                                onChange={(e) => setSiteForm({ ...siteForm, keyPath: e.target.value })}
-                                className={`w-full rounded border px-3 py-1.5 font-mono text-[11px] focus:outline-none transition ${
-                                  isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                                }`}
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-neutral-400 mb-1">Passphrase</label>
-                              <input
-                                type="password"
-                                value={siteForm.passphrase || ""}
-                                onChange={(e) => setSiteForm({ ...siteForm, passphrase: e.target.value })}
-                                className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                                  isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                                }`}
-                              />
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-neutral-500">
-                    Sélectionnez un site ou cliquez sur Nouveau
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between border-t border-neutral-500/20 px-4 py-3">
-              <button
-                onClick={() => {
-                  if (selectedSiteId) {
-                    setSites(sites.map((s) => (s.id === selectedSiteId ? siteForm : s)));
-                  }
-                }}
-                className="px-3 py-1.5 rounded border border-neutral-700 text-xs hover:bg-neutral-500/10 cursor-pointer transition active:scale-95"
-              >
-                Enregistrer
-              </button>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setShowSiteManager(false)}
-                  className="px-3 py-1.5 rounded border border-neutral-700 text-xs hover:bg-neutral-500/10 cursor-pointer transition"
-                >
-                  Fermer
-                </button>
-                <button
-                  onClick={() => {
-                    if (selectedSiteId) {
-                      setSites(sites.map((s) => (s.id === selectedSiteId ? siteForm : s)));
-                      setShowSiteManager(false);
-                      handleConnectRequest(
-                        siteForm.protocol,
-                        siteForm.host,
-                        siteForm.port,
-                        siteForm.username,
-                        siteForm.authType,
-                        siteForm.password,
-                        siteForm.keyPath,
-                        siteForm.passphrase,
-                        siteForm.id,
-                        siteForm.lastRemotePath,
-                        siteForm.lastLocalPath
-                      );
-                    }
-                  }}
-                  className="px-4 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-                >
-                  Connexion
-                </button>
-              </div>
             </div>
           </div>
         </div>
@@ -3244,3 +2994,4 @@ export default function App() {
     </div>
   );
 }
+

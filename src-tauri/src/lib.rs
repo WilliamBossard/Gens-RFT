@@ -679,14 +679,12 @@ async fn download_single_file(
     remote_path: &str,
     local_path: &Path,
 ) -> Result<(), String> {
-    // 1. Création systématique de toute l'arborescence parente locale
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| format!("Impossible de créer le dossier local ({}): {}", parent.display(), e))?;
     }
 
-    // 2. Ouverture distante
     let mut remote_file = sftp
         .open(remote_path)
         .await
@@ -698,7 +696,6 @@ async fn download_single_file(
         .map(|m| m.size.unwrap_or(0))
         .unwrap_or(0);
 
-    // 3. Création locale Windows
     let mut local_file = tokio::fs::File::create(local_path)
         .await
         .map_err(|e| format!("Erreur création locale ({}): {}", local_path.display(), e))?;
@@ -780,11 +777,9 @@ async fn download_item(
         .as_ref()
         .ok_or_else(|| "Session SFTP inactive".to_string())?;
 
-    // Nettoyage et normalisation du dossier de destination local
     let normalized_dest = local_dest_dir.trim().replace('/', "\\");
     let base_dest = PathBuf::from(&normalized_dest);
 
-    // Vérifie et crée la base locale si elle n'existe pas
     tokio::fs::create_dir_all(&base_dest)
         .await
         .map_err(|e| format!("Dossier local de destination inaccessible ({}): {}", base_dest.display(), e))?;
@@ -868,7 +863,7 @@ async fn read_remote_file_text(
     let mut buffer = Vec::new();
     remote_file.read_to_end(&mut buffer).await.map_err(|e| e.to_string())?;
 
-    String::from_utf8(buffer).map_err(|_| "Ce fichier n'est pas un fichier texte UTF-8 valide (binaire ou encodage non supporté).".to_string())
+    String::from_utf8(buffer).map_err(|_| "Ce fichier n'est pas un fichier texte UTF-8 valide.".to_string())
 }
 
 #[tauri::command]
@@ -1096,6 +1091,97 @@ async fn create_remote_dir(
     sftp.create_dir(&path).await.map_err(|e| e.to_string())
 }
 
+// Compression / Décompression Distante via SSH
+#[tauri::command]
+async fn compress_remote(
+    session_id: String,
+    parent_dir: String,
+    item_name: String,
+    format: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let (archive_name, cmd) = if format == "zip" {
+        (
+            format!("{}.zip", item_name),
+            format!("cd \"{}\" && zip -r \"{}.zip\" \"{}\"", parent_dir, item_name, item_name),
+        )
+    } else {
+        (
+            format!("{}.tar.gz", item_name),
+            format!("cd \"{}\" && tar -czf \"{}.tar.gz\" \"{}\"", parent_dir, item_name, item_name),
+        )
+    };
+    exec_remote_command(session_id, cmd, state).await?;
+    Ok(archive_name)
+}
+
+#[tauri::command]
+async fn extract_remote(
+    session_id: String,
+    parent_dir: String,
+    archive_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cmd = if archive_name.ends_with(".zip") {
+        format!("cd \"{}\" && unzip -o \"{}\"", parent_dir, archive_name)
+    } else if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        format!("cd \"{}\" && tar -xzf \"{}\"", parent_dir, archive_name)
+    } else if archive_name.ends_with(".tar") {
+        format!("cd \"{}\" && tar -xf \"{}\"", parent_dir, archive_name)
+    } else {
+        return Err("Format d'archive non supporté".into());
+    };
+    exec_remote_command(session_id, cmd, state).await?;
+    Ok("Archive extraite avec succès".into())
+}
+
+// Compression / Décompression Locale (Windows PowerShell)
+#[tauri::command]
+fn compress_local(path: String, format: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let name = p.file_name().ok_or("Chemin invalide")?.to_string_lossy();
+    let parent = p.parent().unwrap_or(Path::new("."));
+    let archive_path = parent.join(format!("{}.zip", name));
+    let archive_str = archive_path.to_string_lossy().to_string();
+
+    let ps_cmd = format!(
+        "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+        path.replace('\'', "''"),
+        archive_str.replace('\'', "''")
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_cmd])
+        .output()
+        .map_err(|e| format!("Erreur exécution PowerShell: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(archive_str)
+}
+
+#[tauri::command]
+fn extract_local(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let parent = p.parent().unwrap_or(Path::new("."));
+    let ps_cmd = format!(
+        "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+        path.replace('\'', "''"),
+        parent.to_string_lossy().replace('\'', "''")
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_cmd])
+        .output()
+        .map_err(|e| format!("Erreur exécution PowerShell: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok("Archive locale extraite".into())
+}
+
 fn dirs_next() -> Option<PathBuf> {
     if let Some(userprofile) = std::env::var_os("USERPROFILE") {
         let path = PathBuf::from(userprofile);
@@ -1125,6 +1211,7 @@ fn dirs_next() -> Option<PathBuf> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cancel_transfer: Arc::new(AtomicBool::new(false)),
@@ -1154,7 +1241,11 @@ pub fn run() {
             create_remote_dir,
             rename_local,
             rename_remote,
-            chmod_remote
+            chmod_remote,
+            compress_remote,
+            extract_remote,
+            compress_local,
+            extract_local
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
