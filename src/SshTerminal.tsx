@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -8,13 +8,25 @@ import { listen } from "@tauri-apps/api/event";
 interface Props {
   sessionId: string;
   isConnected: boolean;
+  isVisible?: boolean;
+  protocol?: string;
 }
 
-export default function SshTerminal({ sessionId, isConnected }: Props) {
+export default function SshTerminal({ sessionId, isConnected, isVisible = true, protocol = "SFTP" }: Props) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const ptyStarted = useRef(false);
+
+  useEffect(() => {
+    if (isVisible && fitAddonRef.current) {
+      setTimeout(() => {
+        try {
+          fitAddonRef.current?.fit();
+        } catch {}
+      }, 50);
+    }
+  }, [isVisible]);
 
   useEffect(() => {
     if (!terminalRef.current) return;
@@ -73,26 +85,35 @@ export default function SshTerminal({ sessionId, isConnected }: Props) {
     const fitAddon = fitAddonRef.current;
     if (!term || !fitAddon) return;
 
-    if (isConnected && !ptyStarted.current) {
-      ptyStarted.current = true;
-      term.reset();
-      fitAddon.fit();
-      term.writeln("\x1b[32m[✓] Connexion au canal PTY interactif...\x1b[0m\r\n");
-
-      invoke("start_ssh_pty", {
-        sessionId,
-        cols: term.cols || 80,
-        rows: term.rows || 24,
-      }).catch((err) => {
-        term.writeln(`\r\n\x1b[31m[Erreur lancement PTY] : ${err}\x1b[0m`);
+    if (isConnected) {
+      if (protocol === "FTP" || protocol === "FTPS") {
         ptyStarted.current = false;
-      });
-    } else if (!isConnected) {
+        term.reset();
+        term.writeln("\x1b[33m[!] Le protocole FTP / FTPS ne supporte pas l'accès terminal shell interactif.\x1b[0m\r\n\x1b[90mVeuillez vous connecter via SFTP/SSH pour piloter le serveur en ligne de commande.\x1b[0m");
+        return;
+      }
+
+      if (!ptyStarted.current) {
+        ptyStarted.current = true;
+        term.reset();
+        fitAddon.fit();
+        term.writeln("\x1b[32m[✓] Connexion au canal PTY interactif...\x1b[0m\r\n");
+
+        invoke("start_ssh_pty", {
+          sessionId,
+          cols: term.cols || 80,
+          rows: term.rows || 24,
+        }).catch((err) => {
+          term.writeln(`\r\n\x1b[31m[Erreur lancement PTY] : ${err}\x1b[0m`);
+          ptyStarted.current = false;
+        });
+      }
+    } else {
       ptyStarted.current = false;
       term.reset();
       term.writeln("\x1b[33m[!] En attente de connexion SFTP/SSH pour ouvrir le shell distant...\x1b[0m");
     }
-  }, [isConnected, sessionId]);
+  }, [isConnected, sessionId, protocol]);
 
   return (
     <div className="h-full w-full bg-neutral-950 p-2 overflow-hidden">

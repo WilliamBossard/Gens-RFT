@@ -1,145 +1,42 @@
-﻿import { useEffect, useState, useMemo, useRef } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import SshTerminal from "./SshTerminal";
-import DirectoryTree from "./DirectoryTree";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
 import SiteManagerModal, { SiteProfile } from "./components/modals/SiteManagerModal";
+import ChmodModal, { ChmodModalState } from "./components/modals/ChmodModal";
+import ConflictModal from "./components/modals/ConflictModal";
+import FileEditorModal, { EditorModalState } from "./components/modals/FileEditorModal";
+import SettingsModal from "./components/modals/SettingsModal";
+import ConfirmModal from "./components/modals/ConfirmModal";
+import InputModal from "./components/modals/InputModal";
+import CrossTabModal from "./components/modals/CrossTabModal";
+import TabPromptModal from "./components/modals/TabPromptModal";
+
+import QuickConnectBar from "./components/panels/QuickConnectBar";
+import SessionTabs from "./components/panels/SessionTabs";
+import LocalPane from "./components/panels/LocalPane";
+import RemotePane from "./components/panels/RemotePane";
+import BottomPanel from "./components/panels/BottomPanel";
+import FileContextMenu from "./components/panels/FileContextMenu";
+
+import { encryptVaultData, decryptVaultData } from "./utils/cryptoVault";
 import { useTransferStore } from "./store/useTransferStore";
 import {
-  Server,
-  Folder,
-  FileText,
-  Terminal as TerminalIcon,
-  HardDrive,
-  ArrowUp,
-  Upload,
-  Download,
-  Trash2,
-  FolderPlus,
-  SlidersHorizontal,
-  X,
-  Plus,
-  CheckCircle,
-  Clock,
-  ListOrdered,
-  Search,
-  ArrowUpDown,
-  ShieldCheck,
-  Calculator,
-  ExternalLink,
-  Ban,
-  RotateCcw,
-  AlertTriangle,
-  RefreshCw,
-  Settings,
-  Sliders,
-  Info,
-  ChevronDown,
-  ChevronUp,
-  ChevronLeft,
-  ChevronRight,
-  Monitor,
-  FolderDown,
-  FileSpreadsheet,
-  Star,
-  Edit2,
-  Unplug,
-  FileCode,
-  FileArchive,
-  FileImage,
-  FileCheck,
-  FileEdit,
-  Save,
-  Send,
-  Archive,
-  FolderArchive
-} from "lucide-react";
-
-interface FileEntry {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  size: number;
-  permissions?: number;
-}
-
-interface TransferProgress {
-  transfer_id: string;
-  filename: string;
-  transferred: number;
-  total: number;
-  percent: number;
-  direction: "upload" | "download";
-}
-
-interface TabSession {
-  id: string;
-  title: string;
-  isConnected: boolean;
-  protocol: "SFTP" | "FTP";
-  host: string;
-  port: string;
-  username: string;
-  remotePath: string;
-  remoteFiles: FileEntry[];
-  siteId?: string;
-}
-
-type SortField = "name" | "size";
-type SortOrder = "asc" | "desc";
-
-function isArchiveFile(name: string): boolean {
-  const n = name.toLowerCase();
-  return n.endsWith(".zip") || n.endsWith(".tar.gz") || n.endsWith(".tgz") || n.endsWith(".tar");
-}
-
-function isEditableTextFile(name: string): boolean {
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  const nonEditable = [
-    "zip", "tar", "gz", "7z", "rar", "iso", "exe", "bin", "dll", "so",
-    "png", "jpg", "jpeg", "gif", "webp", "ico", "mp4", "mkv", "avi", "mov", "mp3", "wav",
-    "pdf", "docx", "xlsx", "pptx"
-  ];
-  if (nonEditable.includes(ext)) return false;
-  const editable = [
-    "txt", "md", "sh", "bash", "zsh", "rs", "py", "js", "jsx", "ts", "tsx",
-    "json", "yml", "yaml", "toml", "conf", "cfg", "ini", "env", "css", "html",
-    "log", "xml", "service", "rules"
-  ];
-  return editable.includes(ext) || !name.includes(".");
-}
-
-function getFileBadge(name: string, isDark: boolean) {
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  if (["zip", "tar", "gz", "7z", "rar", "iso"].includes(ext)) {
-    return {
-      icon: <FileArchive className="h-4 w-4 text-amber-500 shrink-0" />,
-      color: isDark ? "text-amber-400" : "text-amber-700",
-    };
-  }
-  if (["rs", "ts", "tsx", "js", "jsx", "py", "sh", "json", "yml", "yaml", "toml", "css", "html"].includes(ext)) {
-    return {
-      icon: <FileCode className="h-4 w-4 text-emerald-500 shrink-0" />,
-      color: isDark ? "text-emerald-300" : "text-emerald-700",
-    };
-  }
-  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "mkv"].includes(ext)) {
-    return {
-      icon: <FileImage className="h-4 w-4 text-purple-500 shrink-0" />,
-      color: isDark ? "text-purple-300" : "text-purple-700",
-    };
-  }
-  if (["pdf", "docx", "doc", "txt", "md", "cfg", "conf", "ini", "env"].includes(ext)) {
-    return {
-      icon: <FileText className="h-4 w-4 text-sky-500 shrink-0" />,
-      color: isDark ? "text-sky-300" : "text-sky-700",
-    };
-  }
-  return {
-    icon: <FileCheck className="h-4 w-4 text-neutral-400 shrink-0" />,
-    color: isDark ? "text-neutral-300" : "text-neutral-800",
-  };
-}
+  FileEntry,
+  TransferProgress,
+  TabSession,
+  QuickHistoryItem,
+  SortField,
+  SortOrder,
+  PendingConflict,
+  ConfirmModalState,
+  InputModalState,
+  CrossTabModalState,
+  TabPromptModalState,
+  ContextMenuState,
+} from "./types";
 
 export default function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
@@ -164,7 +61,6 @@ export default function App() {
   const [showTreePanels, setShowTreePanels] = useState(true);
   const [enableSshTerminal, setEnableSshTerminal] = useState(true);
   const [maxConcurrent, setMaxConcurrent] = useState("2");
-  const [settingsTab, setSettingsTab] = useState<"general" | "panels" | "about">("general");
 
   const [rememberLocalPath, setRememberLocalPath] = useState<boolean>(() => {
     const v = localStorage.getItem("gens_rft_opt_remember_local");
@@ -185,10 +81,6 @@ export default function App() {
     addToQueue,
     updateProgress,
     markStatus,
-    clearDone,
-    cancelAll,
-    retryItem,
-    retryAllFailed,
   } = useTransferStore();
 
   // Sessions / Onglets
@@ -203,6 +95,8 @@ export default function App() {
       username: "",
       remotePath: "/",
       remoteFiles: [],
+      remoteHistory: ["/"],
+      remoteHistoryIndex: 0,
     },
   ]);
   const [activeTabId, setActiveTabId] = useState<string>("tab_1");
@@ -224,6 +118,15 @@ export default function App() {
   const [quickPort, setQuickPort] = useState("22");
   const [quickUser, setQuickUser] = useState("");
   const [quickPass, setQuickPass] = useState("");
+  const [showQuickHistoryDropdown, setShowQuickHistoryDropdown] = useState(false);
+  const [quickHistory, setQuickHistory] = useState<QuickHistoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem("gens_rft_quick_history");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
 
   // Explorateur local
   const [currentPath, setCurrentPath] = useState<string>("");
@@ -241,7 +144,6 @@ export default function App() {
     return saved ? JSON.parse(saved) : ["/var/log", "/home", "/etc"];
   });
   const [showBookmarksMenu, setShowBookmarksMenu] = useState(false);
-  const bookmarksRef = useRef<HTMLDivElement>(null);
 
   // Drag & drop
   const [draggedItem, setDraggedItem] = useState<{ entry: FileEntry; from: "local" | "remote"; fromSessionId?: string } | null>(null);
@@ -254,132 +156,264 @@ export default function App() {
   const [localSort, setLocalSort] = useState<{ field: SortField; order: SortOrder }>({ field: "name", order: "asc" });
   const [remoteSort, setRemoteSort] = useState<{ field: SortField; order: SortOrder }>({ field: "name", order: "asc" });
 
-  // Logs & scroll
+  // Sélections et panneau actif
+  const [selectedLocalPaths, setSelectedLocalPaths] = useState<Set<string>>(new Set());
+  const [selectedRemotePaths, setSelectedRemotePaths] = useState<Set<string>>(new Set());
+  const [activePane, setActivePane] = useState<"local" | "remote">("local");
+
+  const processedLocalFiles = useMemo(() => {
+    return files
+      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
+      .filter((f) => f.name.toLowerCase().includes(localSearch.toLowerCase()))
+      .sort((a, b) => {
+        if (a.is_dir && !b.is_dir) return -1;
+        if (!a.is_dir && b.is_dir) return 1;
+        if (localSort.field === "size") {
+          return localSort.order === "asc" ? a.size - b.size : b.size - a.size;
+        }
+        return localSort.order === "asc"
+          ? a.name.localeCompare(b.name)
+          : b.name.localeCompare(a.name);
+      });
+  }, [files, showHidden, localSearch, localSort]);
+
+  const processedRemoteFiles = useMemo(() => {
+    return activeTab.remoteFiles
+      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
+      .filter((f) => f.name.toLowerCase().includes(remoteSearch.toLowerCase()))
+      .sort((a, b) => {
+        if (a.is_dir && !b.is_dir) return -1;
+        if (!a.is_dir && b.is_dir) return 1;
+        if (remoteSort.field === "size") {
+          return remoteSort.order === "asc" ? a.size - b.size : b.size - a.size;
+        }
+        return remoteSort.order === "asc"
+          ? a.name.localeCompare(b.name)
+          : b.name.localeCompare(a.name);
+      });
+  }, [activeTab.remoteFiles, showHidden, remoteSearch, remoteSort]);
+
+  // Logs & console
   const [logs, setLogs] = useState<string[]>(["Gens-RFT initialisé."]);
-  const logsEndRef = useRef<HTMLDivElement>(null);
   const [activeBottomTab, setActiveBottomTab] = useState<"logs" | "queue" | "terminal">("logs");
   const [bottomOpen, setBottomOpen] = useState(true);
 
   // Modales
   const [showSettings, setShowSettings] = useState(false);
-  const [inputModal, setInputModal] = useState<{
-    title: string;
-    label: string;
-    value: string;
-    onConfirm: (val: string) => void;
-  } | null>(null);
+  const [inputModal, setInputModal] = useState<InputModalState | null>(null);
+  const [confirmModal, setConfirmModal] = useState<ConfirmModalState | null>(null);
+  const [conflictModal, setConflictModal] = useState<any>(null);
+  const [conflictQueue, setConflictQueue] = useState<PendingConflict[]>([]);
+  const [chmodModal, setChmodModal] = useState<ChmodModalState | null>(null);
+  const [crossTabModal, setCrossTabModal] = useState<CrossTabModalState | null>(null);
+  const [tabPromptModal, setTabPromptModal] = useState<TabPromptModalState | null>(null);
+  const [editorModal, setEditorModal] = useState<EditorModalState | null>(null);
+  const [showSiteManager, setShowSiteManager] = useState(false);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
-  const [confirmModal, setConfirmModal] = useState<{
-    title: string;
-    message: string;
-    onConfirm: () => void;
-  } | null>(null);
-
-  const [conflictModal, setConflictModal] = useState<{
-    filename: string;
-    onResolve: (action: "overwrite" | "rename" | "skip") => void;
-  } | null>(null);
-
-  const [chmodModal, setChmodModal] = useState<{ path: string; name: string; octal: string } | null>(null);
-
-  const [crossTabModal, setCrossTabModal] = useState<{
-    item: { entry: FileEntry; from: "local" | "remote" };
-    targetTab: TabSession;
-    neverAskAgain: boolean;
-  } | null>(null);
-
-  const [tabPromptModal, setTabPromptModal] = useState<{
-    pendingParams: {
-      protocol: "SFTP" | "FTP";
-      host: string;
-      port: string;
-      username: string;
-      authType: "password" | "key";
-      password?: string;
-      keyPath?: string;
-      passphrase?: string;
-      siteId?: string;
-      initialRemotePath?: string;
-      initialLocalPath?: string;
-    };
-  } | null>(null);
-
-  // Éditeur
-  const [editorModal, setEditorModal] = useState<{
-    path: string;
-    filename: string;
-    content: string;
-    originalContent: string;
-    saving: boolean;
-  } | null>(null);
-  const [editorSearchQuery, setEditorSearchQuery] = useState("");
-  const [showEditorSearch, setShowEditorSearch] = useState(false);
-  const [editorSearchMatches, setEditorSearchMatches] = useState<number[]>([]);
-  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
-  const editorTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const editorLineNumbersRef = useRef<HTMLDivElement>(null);
+  // Historique local
+  const [localHistory, setLocalHistory] = useState<string[]>([]);
+  const [localHistoryIndex, setLocalHistoryIndex] = useState<number>(-1);
 
   // Sites
-  const [showSiteManager, setShowSiteManager] = useState(false);
-  const [sites, setSites] = useState<SiteProfile[]>(() => {
-    const saved = localStorage.getItem("gens_rft_sites");
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [sites, setSites] = useState<SiteProfile[]>([]);
+  const [isSitesLoaded, setIsSitesLoaded] = useState(false);
 
-  const [contextMenu, setContextMenu] = useState<{
-    x: number;
-    y: number;
-    entry: FileEntry;
-    isRemote: boolean;
-  } | null>(null);
+  // Références toujours à jour
+  const activeTabRef = useRef(activeTab);
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
+
+  const currentPathRef = useRef(currentPath);
+  useEffect(() => {
+    currentPathRef.current = currentPath;
+  }, [currentPath]);
+
+  const localPaneWidthRef = useRef(localPaneWidth);
+  useEffect(() => {
+    localPaneWidthRef.current = localPaneWidth;
+  }, [localPaneWidth]);
 
   const hasLoadedInitialDir = useRef(false);
 
   const logMessage = (msg: string) => {
     const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev, `[${time}] ${msg}`]);
+    setLogs((prev) => [...prev.slice(-999), `[${time}] ${msg}`]);
   };
 
+  // Chargement initial des sites
   useEffect(() => {
-    if (!editorModal || !editorSearchQuery) {
-      setEditorSearchMatches([]);
-      setCurrentMatchIndex(0);
-      return;
-    }
-    const query = editorSearchQuery.toLowerCase();
-    const content = editorModal.content.toLowerCase();
-    const matches: number[] = [];
-    let pos = content.indexOf(query);
-    while (pos !== -1) {
-      matches.push(pos);
-      pos = content.indexOf(query, pos + 1);
-    }
-    setEditorSearchMatches(matches);
-    setCurrentMatchIndex(matches.length > 0 ? 0 : -1);
-  }, [editorSearchQuery, editorModal?.content]);
-
-  useEffect(() => {
-    if (activeBottomTab === "logs" && bottomOpen) {
-      logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [logs, activeBottomTab, bottomOpen]);
-
-  useEffect(() => {
-    const handleGlobalClick = (e: MouseEvent) => {
-      if (bookmarksRef.current && !bookmarksRef.current.contains(e.target as Node)) {
-        setShowBookmarksMenu(false);
+    let isCancelled = false;
+    const loadSecureSites = async () => {
+      const saved = localStorage.getItem("gens_rft_sites");
+      if (saved) {
+        try {
+          const decrypted = await decryptVaultData<SiteProfile[]>(saved, []);
+          if (!isCancelled) setSites(decrypted);
+        } catch {
+          try {
+            if (!isCancelled) setSites(JSON.parse(saved));
+          } catch {}
+        }
       }
-      if (e.button !== 2) {
-        setContextMenu(null);
-      }
+      if (!isCancelled) setIsSitesLoaded(true);
     };
-    window.addEventListener("mousedown", handleGlobalClick);
-    return () => window.removeEventListener("mousedown", handleGlobalClick);
+    loadSecureSites();
+    return () => {
+      isCancelled = true;
+    };
   }, []);
 
+  // Fermer les menus au clic extérieur
+  useEffect(() => {
+    const handleGlobalClick = () => {
+      setContextMenu(null);
+    };
+    window.addEventListener("click", handleGlobalClick);
+    return () => window.removeEventListener("click", handleGlobalClick);
+  }, []);
+
+  // Raccourcis claviers globaux
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key.toLowerCase() === "t") {
+      const targetTag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (targetTag === "input" || targetTag === "textarea") return;
+
+      if (
+        showSettings ||
+        showSiteManager ||
+        conflictModal ||
+        chmodModal ||
+        editorModal ||
+        confirmModal ||
+        inputModal ||
+        crossTabModal ||
+        tabPromptModal
+      ) {
+        return;
+      }
+
+      if (e.key === "F5") {
+        e.preventDefault();
+        loadLocalDirectory(currentPath);
+        if (activeTab.isConnected) {
+          loadRemoteDirectory(activeTab.remotePath);
+        }
+        logMessage("Rafraîchissement des répertoires.");
+      } else if (e.key === "Delete" || e.key === "Del") {
+        if (activePane === "local" && selectedLocalPaths.size > 0) {
+          e.preventDefault();
+          const itemsToDelete = files.filter((f) => selectedLocalPaths.has(f.path));
+          if (itemsToDelete.length === 0) return;
+          setConfirmModal({
+            title: "Suppression définitive",
+            message:
+              itemsToDelete.length === 1
+                ? `Supprimer "${itemsToDelete[0].name}" ? Cette action est irréversible.`
+                : `Supprimer ces ${itemsToDelete.length} éléments locaux définitivement ?`,
+            onConfirm: async () => {
+              for (const it of itemsToDelete) {
+                try {
+                  await invoke("delete_local", { path: it.path, isDir: it.is_dir });
+                } catch (err) {
+                  logMessage(`Erreur suppression ${it.name} : ${err}`);
+                }
+              }
+              setSelectedLocalPaths(new Set());
+              loadLocalDirectory(currentPath);
+            },
+          });
+        } else if (activePane === "remote" && selectedRemotePaths.size > 0 && activeTab.isConnected) {
+          e.preventDefault();
+          const itemsToDelete = activeTab.remoteFiles.filter((f) => selectedRemotePaths.has(f.path));
+          if (itemsToDelete.length === 0) return;
+          setConfirmModal({
+            title: "Suppression distante",
+            message:
+              itemsToDelete.length === 1
+                ? `Supprimer "${itemsToDelete[0].name}" du serveur ?`
+                : `Supprimer ces ${itemsToDelete.length} éléments distants ?`,
+            onConfirm: async () => {
+              for (const it of itemsToDelete) {
+                try {
+                  await invoke("delete_remote", {
+                    sessionId: activeTab.id,
+                    path: it.path,
+                    isDir: it.is_dir,
+                  });
+                } catch (err) {
+                  logMessage(`Erreur suppression ${it.name} : ${err}`);
+                }
+              }
+              setSelectedRemotePaths(new Set());
+              loadRemoteDirectory(activeTab.remotePath);
+            },
+          });
+        }
+      } else if (e.key === "F2") {
+        if (activePane === "local" && selectedLocalPaths.size === 1) {
+          e.preventDefault();
+          const entry = files.find((f) => selectedLocalPaths.has(f.path));
+          if (!entry) return;
+          setInputModal({
+            title: "Renommer l'élément local",
+            label: "Nouveau nom :",
+            value: entry.name,
+            onConfirm: async (val) => {
+              if (!val.trim() || val.trim() === entry.name) return;
+              const newName = val.trim();
+              const sep = entry.path.includes("/") ? "/" : "\\";
+              const parent = entry.path.split(sep).slice(0, -1).join(sep);
+              const newPath = `${parent}${sep}${newName}`;
+              try {
+                await invoke("rename_local", { oldPath: entry.path, newPath });
+                logMessage(`Renommé en local : ${entry.name} -> ${newName}`);
+                loadLocalDirectory(currentPath);
+              } catch (err) {
+                logMessage(`Erreur renommage : ${err}`);
+              }
+            },
+          });
+        } else if (activePane === "remote" && selectedRemotePaths.size === 1 && activeTab.isConnected) {
+          e.preventDefault();
+          const entry = activeTab.remoteFiles.find((f) => selectedRemotePaths.has(f.path));
+          if (!entry) return;
+          setInputModal({
+            title: "Renommer l'élément distant",
+            label: "Nouveau nom :",
+            value: entry.name,
+            onConfirm: async (val) => {
+              if (!val.trim() || val.trim() === entry.name) return;
+              const newName = val.trim();
+              const parent = entry.path.split("/").slice(0, -1).join("/") || "/";
+              const newPath = parent.endsWith("/") ? `${parent}${newName}` : `${parent}/${newName}`;
+              try {
+                await invoke("rename_remote", {
+                  sessionId: activeTab.id,
+                  oldPath: entry.path,
+                  newPath,
+                });
+                logMessage(`Renommé à distance : ${entry.name} -> ${newName}`);
+                loadRemoteDirectory(activeTab.remotePath);
+              } catch (err) {
+                logMessage(`Erreur renommage distant : ${err}`);
+              }
+            },
+          });
+        }
+      } else if (e.ctrlKey && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        if (activePane === "local") {
+          setSelectedLocalPaths(new Set(processedLocalFiles.map((f) => f.path)));
+        } else if (activePane === "remote" && activeTab.isConnected) {
+          setSelectedRemotePaths(new Set(processedRemoteFiles.map((f) => f.path)));
+        }
+      } else if (e.key === "Escape") {
+        setSelectedLocalPaths(new Set());
+        setSelectedRemotePaths(new Set());
+        setContextMenu(null);
+      } else if (e.ctrlKey && e.key.toLowerCase() === "t") {
         e.preventDefault();
         createNewTab();
       } else if (e.ctrlKey && e.key.toLowerCase() === "w") {
@@ -391,23 +425,47 @@ export default function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [tabs, activeTabId]);
+  }, [
+    tabs,
+    activeTabId,
+    currentPath,
+    activeTab.isConnected,
+    activeTab.remotePath,
+    activePane,
+    selectedLocalPaths,
+    selectedRemotePaths,
+    files,
+    activeTab.remoteFiles,
+    processedLocalFiles,
+    processedRemoteFiles,
+    showSettings,
+    showSiteManager,
+    conflictModal,
+    chmodModal,
+    editorModal,
+    confirmModal,
+    inputModal,
+    crossTabModal,
+    tabPromptModal,
+  ]);
 
   useEffect(() => {
     setRemotePathInput(activeTab.remotePath);
   }, [activeTab.remotePath]);
 
+  // Sauvegarde sécurisée des profils
   useEffect(() => {
-    setLocalPathInput(currentPath);
-  }, [currentPath]);
-
-  useEffect(() => {
-    localStorage.setItem("gens_rft_bookmarks", JSON.stringify(bookmarks));
-  }, [bookmarks]);
-
-  useEffect(() => {
-    localStorage.setItem("gens_rft_sites", JSON.stringify(sites));
-  }, [sites]);
+    if (!isSitesLoaded) return;
+    const saveSecureSites = async () => {
+      try {
+        const encrypted = await encryptVaultData(sites);
+        localStorage.setItem("gens_rft_sites", encrypted);
+      } catch {
+        localStorage.setItem("gens_rft_sites", JSON.stringify(sites));
+      }
+    };
+    saveSecureSites();
+  }, [sites, isSitesLoaded]);
 
   useEffect(() => {
     localStorage.setItem("gens_rft_opt_remember_local", JSON.stringify(rememberLocalPath));
@@ -417,11 +475,19 @@ export default function App() {
     localStorage.setItem("gens_rft_opt_remember_remote", JSON.stringify(rememberRemotePath));
   }, [rememberRemotePath]);
 
+  // Mémorisation du chemin local
   useEffect(() => {
     if (rememberLocalPath && currentPath) {
       localStorage.setItem("gens_rft_last_local_path", currentPath);
+      if (activeTab?.siteId) {
+        setSites((prev) =>
+          prev.map((s) =>
+            s.id === activeTab.siteId ? { ...s, lastLocalPath: currentPath } : s
+          )
+        );
+      }
     }
-  }, [currentPath, rememberLocalPath]);
+  }, [currentPath, rememberLocalPath, activeTab?.siteId]);
 
   useEffect(() => {
     const preventDrag = (e: DragEvent) => {
@@ -438,6 +504,7 @@ export default function App() {
     };
   }, []);
 
+  // Écoute de la progression de transfert
   useEffect(() => {
     const unlisten = listen<TransferProgress>("transfer_progress", (event) => {
       const p = event.payload;
@@ -449,75 +516,223 @@ export default function App() {
     };
   }, [updateProgress]);
 
+  // Glisser-déposer externe natif Tauri v2
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview()
+      .onDragDropEvent(async (event) => {
+        if (event.payload.type === "drop") {
+          const paths = event.payload.paths;
+          if (!paths || paths.length === 0) return;
+          const rawX = event.payload.position.x;
+          const scale = window.devicePixelRatio || 1;
+          const x = rawX / scale;
+          const splitX = (window.innerWidth * localPaneWidthRef.current) / 100;
+          const isRemotePane = x > splitX;
+
+          if (isRemotePane) {
+            const currentTab = activeTabRef.current;
+            if (!currentTab.isConnected) {
+              logMessage("Erreur : Impossible d'envoyer des fichiers, serveur déconnecté.");
+              return;
+            }
+            for (const p of paths) {
+              const name = p.split(/[\\/]/).pop() || "fichier";
+              const isDir = await invoke<boolean>("is_local_dir", { path: p }).catch(() => false);
+              checkAndEnqueueTransfer(name, p, currentTab.remotePath, "upload", isDir, currentTab.id);
+            }
+            logMessage(`Glisser-déposer externe : ${paths.length} élément(s) ajouté(s) à la file.`);
+          } else {
+            loadLocalDirectory(currentPathRef.current, false);
+          }
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Boucle des transferts concurrents
+  const inFlightIdsRef = useRef<Set<string>>(new Set());
   const concurrentLimit = parseInt(maxConcurrent) || 2;
   const runningCount = queue.filter((item) => item.status === "running").length;
+  const runningCountRef = useRef(runningCount);
+  useEffect(() => {
+    runningCountRef.current = runningCount;
+  }, [runningCount]);
+
+  // Confirmation avant fermeture si transfert en cours
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        if (runningCountRef.current > 0) {
+          event.preventDefault();
+          setConfirmModal({
+            title: "Transferts en cours",
+            message: `Il y a actuellement ${runningCountRef.current} transfert(s) en cours d'exécution. Voulez-vous vraiment interrompre les transferts et quitter Gens-RFT ?`,
+            onConfirm: async () => {
+              await invoke("cancel_current_transfer", { transferId: null }).catch(() => {});
+              await getCurrentWindow().destroy();
+            },
+          });
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     if (runningCount >= concurrentLimit) return;
 
-    const nextItem = queue.find((item) => item.status === "queued");
+    const nextItem = queue.find((item) => item.status === "queued" && !inFlightIdsRef.current.has(item.id));
     if (!nextItem) return;
 
+    inFlightIdsRef.current.add(nextItem.id);
     markStatus(nextItem.id, "running");
 
     const executeTransfer = async () => {
       try {
         if (nextItem.direction === "upload") {
-          logMessage(`STOR [${nextItem.filename}] -> ${nextItem.destDir}`);
+          const finalUploadName = nextItem.destFileName || nextItem.filename;
+          logMessage(`STOR [${finalUploadName}] -> ${nextItem.destDir}`);
           await invoke("upload_item", {
             sessionId: nextItem.sessionId,
             transferId: nextItem.id,
             localPath: nextItem.sourcePath,
             remoteDestDir: nextItem.destDir,
+            destFilename: finalUploadName,
           });
-          if (activeTab.id === nextItem.sessionId) {
-            loadRemoteDirectory(activeTab.remotePath);
+          if (
+            activeTabRef.current.id === nextItem.sessionId &&
+            activeTabRef.current.remotePath.replace(/\/+$/, "") === nextItem.destDir.replace(/\/+$/, "")
+          ) {
+            loadRemoteDirectory(activeTabRef.current.remotePath, nextItem.sessionId, false);
           }
         } else {
-          logMessage(`RETR [${nextItem.filename}] -> ${nextItem.destDir}`);
+          const finalDownloadName = nextItem.destFileName || nextItem.filename;
+          logMessage(`RETR [${finalDownloadName}] -> ${nextItem.destDir}`);
           await invoke("download_item", {
             sessionId: nextItem.sessionId,
             transferId: nextItem.id,
             remotePath: nextItem.sourcePath,
             localDestDir: nextItem.destDir,
+            destFilename: finalDownloadName,
             isDir: nextItem.isDir,
           });
-          loadLocalDirectory(currentPath);
+
+          if (nextItem.relayToSessionId && nextItem.relayDestDir) {
+            const finalRelayName = nextItem.destFileName || nextItem.filename;
+            const localRelayFile = `${nextItem.destDir.replace(/[\\/]+$/, "")}\\${finalRelayName}`;
+            logMessage(`Relais inter-serveurs : Envoi vers le serveur cible (${finalRelayName})...`);
+            updateProgress(nextItem.id, 0, 100, 0);
+            await invoke("upload_item", {
+              sessionId: nextItem.relayToSessionId,
+              transferId: nextItem.id,
+              localPath: localRelayFile,
+              remoteDestDir: nextItem.relayDestDir,
+              destFilename: finalRelayName,
+            });
+            try {
+              await invoke("delete_local", { path: localRelayFile, isDir: nextItem.isDir });
+              await invoke("delete_local", { path: nextItem.destDir, isDir: true });
+            } catch {}
+            if (
+              activeTabRef.current.id === nextItem.relayToSessionId &&
+              activeTabRef.current.remotePath.replace(/\/+$/, "") === nextItem.relayDestDir.replace(/\/+$/, "")
+            ) {
+              loadRemoteDirectory(activeTabRef.current.remotePath, nextItem.relayToSessionId, false);
+            }
+          } else {
+            const normCurrent = currentPathRef.current.replace(/[\\/]+$/, "").toLowerCase();
+            const normDest = nextItem.destDir.replace(/[\\/]+$/, "").toLowerCase();
+            if (normCurrent === normDest) {
+              loadLocalDirectory(currentPathRef.current, false);
+            }
+          }
         }
 
+        inFlightIdsRef.current.delete(nextItem.id);
         markStatus(nextItem.id, "done");
         logMessage(`226 Transfert terminé : ${nextItem.filename}`);
       } catch (err) {
-        markStatus(nextItem.id, "error");
-        logMessage(`550 Échec de transfert (${nextItem.filename}) : ${err}`);
+        inFlightIdsRef.current.delete(nextItem.id);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        markStatus(nextItem.id, "error", errorMsg);
+        logMessage(`550 Échec de transfert (${nextItem.filename}) : ${errorMsg}`);
+        if (nextItem.relayToSessionId && nextItem.destDir) {
+          try {
+            await invoke("delete_local", { path: nextItem.destDir, isDir: true });
+          } catch {}
+        }
       }
     };
 
     executeTransfer();
-  }, [queue, runningCount, activeTab.remotePath, currentPath, concurrentLimit, activeTab.id, markStatus]);
+  }, [queue, runningCount, concurrentLimit, markStatus, updateProgress]);
 
-  const loadLocalDirectory = async (targetPath?: string) => {
+  // Chargement dossier local
+  const loadLocalDirectory = async (targetPath?: string, recordHistory = true) => {
     try {
       logMessage(`CWD Local: ${targetPath || "dossier utilisateur"}`);
       const result = await invoke<FileEntry[]>("read_local_dir", { path: targetPath || null });
       setFiles(result);
+      let effectivePath = targetPath;
       if (targetPath) {
         setCurrentPath(targetPath);
       } else if (result.length > 0 && !currentPath) {
         const parent = result[0].path.split(/[\\/]/).slice(0, -1).join("\\");
-        setCurrentPath(parent || "C:\\");
+        effectivePath = parent || "C:\\";
+        setCurrentPath(effectivePath);
       }
-      logMessage(`250 ${result.length} élément(s) listé(s) en local.`);
+      if (effectivePath && recordHistory) {
+        setLocalHistory((prev) => {
+          if (localHistoryIndex >= 0 && prev[localHistoryIndex] === effectivePath) {
+            return prev;
+          }
+          const next = prev.slice(0, localHistoryIndex + 1);
+          next.push(effectivePath!);
+          return next;
+        });
+        setLocalHistoryIndex((prev) => prev + 1);
+      }
     } catch (err) {
-      logMessage(`550 Dossier local introuvable ou inaccessible (${targetPath}) : ${err}`);
-      if (targetPath && targetPath !== "C:\\") {
-        logMessage("Repli automatique sur la racine C:\\");
-        loadLocalDirectory("C:\\");
+      logMessage(`Erreur lecture locale (${targetPath}) : ${err}`);
+      if (drives.length > 0 && targetPath !== drives[0]) {
+        loadLocalDirectory(drives[0], false);
       }
     }
   };
 
-  const loadRemoteDirectory = async (targetPath?: string, targetSessionId?: string) => {
+  const handleLocalHistoryBack = () => {
+    if (localHistoryIndex > 0) {
+      const target = localHistory[localHistoryIndex - 1];
+      setLocalHistoryIndex(localHistoryIndex - 1);
+      loadLocalDirectory(target, false);
+    }
+  };
+
+  const handleLocalHistoryForward = () => {
+    if (localHistoryIndex < localHistory.length - 1) {
+      const target = localHistory[localHistoryIndex + 1];
+      setLocalHistoryIndex(localHistoryIndex + 1);
+      loadLocalDirectory(target, false);
+    }
+  };
+
+  // Chargement dossier distant
+  const loadRemoteDirectory = async (targetPath?: string, targetSessionId?: string, recordHistory = true) => {
     const sId = targetSessionId || activeTab.id;
     const fallbackPath = "/";
     try {
@@ -527,13 +742,45 @@ export default function App() {
         path: targetPath || null,
       });
 
+      const effectivePath = targetPath || "/";
       setTabs((prev) =>
-        prev.map((t) =>
-          t.id === sId
-            ? { ...t, remoteFiles: result, remotePath: targetPath || "/" }
-            : t
-        )
+        prev.map((t) => {
+          if (t.id !== sId) return t;
+          let newHistory = t.remoteHistory || ["/"];
+          let newIndex = t.remoteHistoryIndex ?? (newHistory.length - 1);
+          if (recordHistory) {
+            const currentRecorded = newHistory[newIndex];
+            if (currentRecorded !== effectivePath) {
+              const next = newHistory.slice(0, newIndex + 1);
+              next.push(effectivePath);
+              newHistory = next;
+              newIndex = next.length - 1;
+            }
+          }
+          return {
+            ...t,
+            remoteFiles: result,
+            remotePath: effectivePath,
+            remoteHistory: newHistory,
+            remoteHistoryIndex: newIndex,
+          };
+        })
       );
+
+      if (rememberRemotePath) {
+        setTabs((currentTabs) => {
+          const tab = currentTabs.find((t) => t.id === sId);
+          if (tab?.siteId) {
+            setSites((sitesPrev) =>
+              sitesPrev.map((s) =>
+                s.id === tab.siteId ? { ...s, lastRemotePath: effectivePath } : s
+              )
+            );
+          }
+          return currentTabs;
+        });
+      }
+
       logMessage(`250 ${result.length} élément(s) listé(s) sur le serveur distant.`);
     } catch (err) {
       logMessage(`550 Erreur dossier distant (${targetPath}) : ${err}`);
@@ -556,9 +803,37 @@ export default function App() {
     }
   };
 
+  const currentRemoteIndex = activeTab.remoteHistoryIndex ?? 0;
+  const currentRemoteHistory = activeTab.remoteHistory || ["/"];
+
+  const handleRemoteHistoryBack = () => {
+    if (currentRemoteIndex > 0) {
+      const target = currentRemoteHistory[currentRemoteIndex - 1];
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === activeTab.id ? { ...t, remoteHistoryIndex: currentRemoteIndex - 1 } : t
+        )
+      );
+      loadRemoteDirectory(target, activeTab.id, false);
+    }
+  };
+
+  const handleRemoteHistoryForward = () => {
+    if (currentRemoteIndex < currentRemoteHistory.length - 1) {
+      const target = currentRemoteHistory[currentRemoteIndex + 1];
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === activeTab.id ? { ...t, remoteHistoryIndex: currentRemoteIndex + 1 } : t
+        )
+      );
+      loadRemoteDirectory(target, activeTab.id, false);
+    }
+  };
+
+  // Connexion
   const executeConnect = async (
     targetSessionId: string,
-    protocol: "SFTP" | "FTP",
+    protocol: "SFTP" | "FTP" | "FTPS",
     targetHost: string,
     targetPort: string,
     targetUser: string,
@@ -576,7 +851,7 @@ export default function App() {
         sessionId: targetSessionId,
         protocol,
         host: targetHost,
-        port: parseInt(targetPort, 10) || (protocol === "FTP" ? 21 : 22),
+        port: parseInt(targetPort, 10) || (protocol === "FTP" || protocol === "FTPS" ? 21 : 22),
         username: targetUser,
         authType,
         password: targetPass || null,
@@ -604,6 +879,23 @@ export default function App() {
         )
       );
 
+      if (targetHost && targetUser) {
+        setQuickHistory((prev) => {
+          const entry: QuickHistoryItem = {
+            host: targetHost,
+            port: targetPort,
+            username: targetUser,
+            protocol,
+          };
+          const filtered = prev.filter(
+            (it) => !(it.host === entry.host && it.port === entry.port && it.username === entry.username && it.protocol === entry.protocol)
+          );
+          const updated = [entry, ...filtered].slice(0, 10);
+          localStorage.setItem("gens_rft_quick_history", JSON.stringify(updated));
+          return updated;
+        });
+      }
+
       if (rememberLocalPath && initialLocalPath) {
         loadLocalDirectory(initialLocalPath);
       }
@@ -616,7 +908,7 @@ export default function App() {
   };
 
   const handleConnectRequest = (
-    protocol: "SFTP" | "FTP",
+    protocol: "SFTP" | "FTP" | "FTPS",
     targetHost: string,
     targetPort: string,
     targetUser: string,
@@ -697,6 +989,8 @@ export default function App() {
       username: "",
       remotePath: "/",
       remoteFiles: [],
+      remoteHistory: ["/"],
+      remoteHistoryIndex: 0,
     };
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newId);
@@ -721,14 +1015,18 @@ export default function App() {
   };
 
   const handleFinishRenameTab = () => {
-    if (editingTabId && editingTabTitle.trim()) {
-      setTabs((prev) =>
-        prev.map((t) => (t.id === editingTabId ? { ...t, title: editingTabTitle.trim() } : t))
-      );
+    if (editingTabId) {
+      const trimmed = editingTabTitle.trim();
+      if (trimmed) {
+        setTabs((prev) =>
+          prev.map((t) => (t.id === editingTabId ? { ...t, title: trimmed } : t))
+        );
+      }
+      setEditingTabId(null);
     }
-    setEditingTabId(null);
   };
 
+  // Chargement initial des volumes et dossiers locaux
   useEffect(() => {
     if (!hasLoadedInitialDir.current) {
       hasLoadedInitialDir.current = true;
@@ -745,55 +1043,35 @@ export default function App() {
     }
   }, [rememberLocalPath]);
 
+  // Enfilement avec détection de conflit
   const checkAndEnqueueTransfer = (
     filename: string,
     sourcePath: string,
     destDir: string,
     direction: "upload" | "download",
     isDir: boolean,
-    targetSessionId?: string
+    destSessionId?: string
   ) => {
-    const destSessionId = targetSessionId || activeTab.id;
-    const destSession = tabs.find((t) => t.id === destSessionId);
-    const targetFileList = direction === "upload" ? destSession?.remoteFiles || [] : files;
-    const exists = targetFileList.some((f) => f.name.toLowerCase() === filename.toLowerCase());
+    const targetFileList = direction === "upload" ? activeTab.remoteFiles : files;
+    const exists = direction === "download"
+      ? targetFileList.some((f) => f.name.toLowerCase() === filename.toLowerCase())
+      : targetFileList.some((f) => f.name.toLowerCase() === filename.toLowerCase());
 
     if (exists) {
-      setConflictModal({
-        filename,
-        onResolve: (action) => {
-          if (action === "skip") {
-            logMessage(`Transfert de "${filename}" ignoré.`);
-            setConflictModal(null);
-            return;
-          }
-
-          let finalName = filename;
-          if (action === "rename") {
-            const extIdx = filename.lastIndexOf(".");
-            finalName =
-              extIdx > 0
-                ? `${filename.substring(0, extIdx)} (copie)${filename.substring(extIdx)}`
-                : `${filename} (copie)`;
-          }
-
-          addToQueue({
-            sessionId: destSessionId,
-            filename: finalName,
-            sourcePath,
-            destDir,
-            destFileName: finalName,
-            direction,
-            isDir,
-          });
-          setActiveBottomTab("queue");
-          setBottomOpen(true);
-          setConflictModal(null);
+      setConflictQueue((prev) => [
+        ...prev,
+        {
+          filename,
+          sourcePath,
+          destDir,
+          direction,
+          isDir,
+          destSessionId: destSessionId || activeTab.id,
         },
-      });
+      ]);
     } else {
       addToQueue({
-        sessionId: destSessionId,
+        sessionId: destSessionId || activeTab.id,
         filename,
         sourcePath,
         destDir,
@@ -806,1731 +1084,321 @@ export default function App() {
     }
   };
 
-  const processedLocalFiles = useMemo(() => {
-    return files
-      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
-      .filter((f) => f.name.toLowerCase().includes(localSearch.toLowerCase()))
-      .sort((a, b) => {
-        if (a.is_dir && !b.is_dir) return -1;
-        if (!a.is_dir && b.is_dir) return 1;
-        if (localSort.field === "size") {
-          return localSort.order === "asc" ? a.size - b.size : b.size - a.size;
-        }
-        return localSort.order === "asc"
-          ? a.name.localeCompare(b.name)
-          : b.name.localeCompare(a.name);
+  // Traitement file de conflits
+  useEffect(() => {
+    if (conflictQueue.length > 0 && !conflictModal) {
+      const current = conflictQueue[0];
+      setConflictModal({
+        filename: current.filename,
+        remainingCount: conflictQueue.length,
+        onResolve: (action: "overwrite" | "rename" | "skip", applyToAll: boolean) => {
+          if (applyToAll) {
+            for (const item of conflictQueue) {
+              if (action === "skip") {
+                logMessage(`Transfert de "${item.filename}" ignoré.`);
+              } else {
+                let finalName = item.filename;
+                if (action === "rename") {
+                  const extIdx = item.filename.lastIndexOf(".");
+                  finalName =
+                    extIdx > 0
+                      ? `${item.filename.substring(0, extIdx)} (copie)${item.filename.substring(extIdx)}`
+                      : `${item.filename} (copie)`;
+                }
+                addToQueue({
+                  sessionId: item.destSessionId,
+                  filename: item.filename,
+                  destFileName: finalName,
+                  sourcePath: item.sourcePath,
+                  destDir: item.destDir,
+                  direction: item.direction,
+                  isDir: item.isDir,
+                });
+              }
+            }
+            setConflictQueue([]);
+            setActiveBottomTab("queue");
+            setBottomOpen(true);
+            setConflictModal(null);
+          } else {
+            if (action === "skip") {
+              logMessage(`Transfert de "${current.filename}" ignoré.`);
+            } else {
+              let finalName = current.filename;
+              if (action === "rename") {
+                const extIdx = current.filename.lastIndexOf(".");
+                finalName =
+                  extIdx > 0
+                    ? `${current.filename.substring(0, extIdx)} (copie)${current.filename.substring(extIdx)}`
+                    : `${current.filename} (copie)`;
+              }
+              addToQueue({
+                sessionId: current.destSessionId,
+                filename: current.filename,
+                destFileName: finalName,
+                sourcePath: current.sourcePath,
+                destDir: current.destDir,
+                direction: current.direction,
+                isDir: current.isDir,
+              });
+              setActiveBottomTab("queue");
+              setBottomOpen(true);
+            }
+            setConflictQueue((prev: PendingConflict[]) => prev.slice(1));
+            setConflictModal(null);
+          }
+        },
       });
-  }, [files, showHidden, localSearch, localSort]);
+    }
+  }, [conflictQueue, conflictModal, addToQueue]);
 
-  const processedRemoteFiles = useMemo(() => {
-    return activeTab.remoteFiles
-      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
-      .filter((f) => f.name.toLowerCase().includes(remoteSearch.toLowerCase()))
-      .sort((a, b) => {
-        if (a.is_dir && !b.is_dir) return -1;
-        if (!a.is_dir && b.is_dir) return 1;
-        if (remoteSort.field === "size") {
-          return remoteSort.order === "asc" ? a.size - b.size : b.size - a.size;
-        }
-        return remoteSort.order === "asc"
-          ? a.name.localeCompare(b.name)
-          : b.name.localeCompare(a.name);
-      });
-  }, [activeTab.remoteFiles, showHidden, remoteSearch, remoteSort]);
+  // Relais inter-onglets
+  const enqueueCrossTabTransfer = async (
+    item: { entry: FileEntry; from: "local" | "remote"; fromSessionId?: string },
+    targetTab: TabSession
+  ) => {
+    if (item.from === "remote" && item.fromSessionId && item.fromSessionId !== targetTab.id) {
+      try {
+        const tempBase = await invoke<string>("get_temp_dir");
+        const transferSubdir = `${tempBase}\\relay_${Date.now()}`;
+        await invoke("create_local_dir", { path: transferSubdir });
+
+        addToQueue({
+          sessionId: item.fromSessionId,
+          filename: item.entry.name,
+          destFileName: item.entry.name,
+          sourcePath: item.entry.path,
+          destDir: transferSubdir,
+          direction: "download",
+          isDir: item.entry.is_dir,
+          relayToSessionId: targetTab.id,
+          relayDestDir: targetTab.remotePath,
+        });
+
+        setActiveBottomTab("queue");
+        setBottomOpen(true);
+        logMessage(`Relais inter-serveurs programmé : ${item.entry.name} -> ${targetTab.title}`);
+      } catch (err) {
+        logMessage(`Erreur initialisation relais : ${err}`);
+      }
+    } else {
+      checkAndEnqueueTransfer(
+        item.entry.name,
+        item.entry.path,
+        targetTab.remotePath,
+        "upload",
+        item.entry.is_dir,
+        targetTab.id
+      );
+    }
+  };
 
   return (
     <div
-      className={`flex h-screen w-screen flex-col font-sans select-none antialiased ${
-        isDark ? "bg-neutral-950 text-neutral-200" : "bg-neutral-100 text-neutral-900"
+      className={`flex h-screen w-screen flex-col overflow-hidden font-sans select-none ${
+        isDark ? "bg-neutral-950 text-neutral-200" : "bg-neutral-50 text-neutral-800"
       }`}
     >
-      {/* Barre d'outils supérieure */}
-      <header
-        className={`flex flex-wrap items-center justify-between border-b px-2 py-1.5 gap-2 transition-colors ${
-          isDark ? "border-neutral-800 bg-neutral-900 text-neutral-100" : "border-neutral-300 bg-white text-neutral-800"
-        }`}
-      >
-        <div className="flex items-center gap-1.5 shrink-0">
-          <button
-            onClick={() => {
-              setShowBookmarksMenu(false);
-              setShowSettings(false);
-              setShowSiteManager(true);
-            }}
-            className={`flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs cursor-pointer transition active:scale-95 ${
-              isDark
-                ? "border-neutral-700 bg-neutral-800 text-neutral-200 hover:bg-neutral-700 hover:text-white"
-                : "border-neutral-300 bg-neutral-100 text-neutral-800 hover:bg-neutral-200"
-            }`}
-            title="Gestionnaire de sites (Vos serveurs)"
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5 text-sky-500" />
-            <span className="font-medium">Sites</span>
-          </button>
+      {/* Barre de connexion rapide supérieure */}
+      <QuickConnectBar
+        isDark={isDark}
+        activeTab={activeTab}
+        quickHost={quickHost}
+        setQuickHost={setQuickHost}
+        quickPort={quickPort}
+        setQuickPort={setQuickPort}
+        quickUser={quickUser}
+        setQuickUser={setQuickUser}
+        quickPass={quickPass}
+        setQuickPass={setQuickPass}
+        quickHistory={quickHistory}
+        setQuickHistory={setQuickHistory}
+        showQuickHistoryDropdown={showQuickHistoryDropdown}
+        setShowQuickHistoryDropdown={setShowQuickHistoryDropdown}
+        showSiteManager={showSiteManager}
+        setShowSiteManager={setShowSiteManager}
+        showSettings={showSettings}
+        setShowSettings={setShowSettings}
+        onConnectRequest={handleConnectRequest}
+        onDisconnect={handleDisconnect}
+      />
 
-          <button
-            onClick={() => {
-              logMessage("Actualisation des deux répertoires...");
-              loadLocalDirectory(currentPath);
-              if (activeTab.isConnected) loadRemoteDirectory(activeTab.remotePath);
-            }}
-            className={`flex items-center gap-1 px-2.5 py-1 rounded border cursor-pointer text-xs transition active:scale-95 ${
-              isDark
-                ? "border-neutral-700 bg-neutral-800 text-neutral-200 hover:text-white"
-                : "border-neutral-300 bg-neutral-100 text-neutral-800 hover:bg-neutral-200"
-            }`}
-            title="Actualiser les deux panneaux"
-          >
-            <RefreshCw className="h-3.5 w-3.5 text-emerald-500" />
-            <span>Actualiser</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setShowBookmarksMenu(false);
-              setShowSiteManager(false);
-              setShowSettings(true);
-            }}
-            className={`flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs cursor-pointer transition active:scale-95 ${
-              showSettings
-                ? "border-sky-500 bg-sky-600 text-white"
-                : isDark
-                ? "border-neutral-700 bg-neutral-800 text-neutral-200 hover:bg-neutral-700 hover:text-white"
-                : "border-neutral-300 bg-neutral-100 text-neutral-800 hover:bg-neutral-200"
-            }`}
-            title="Paramètres de l'application"
-          >
-            <Settings className="h-3.5 w-3.5 text-sky-400" />
-            <span className="font-medium">Paramètres</span>
-          </button>
-        </div>
-
-        {/* Connexion rapide */}
-        <div
-          className={`flex flex-1 max-w-xl items-center rounded-lg border p-0.5 shadow-inner transition-colors ${
-            isDark ? "border-neutral-800 bg-neutral-950 text-neutral-200" : "border-neutral-300 bg-neutral-50 text-neutral-800"
-          }`}
-        >
-          <input
-            type="text"
-            placeholder="Hôte"
-            value={quickHost}
-            onChange={(e) => setQuickHost(e.target.value)}
-            className="bg-transparent px-2.5 py-1 text-xs placeholder-neutral-500 focus:outline-none flex-1 min-w-[90px] border-r border-neutral-700/50"
-          />
-          <input
-            type="text"
-            placeholder="Port"
-            value={quickPort}
-            onChange={(e) => setQuickPort(e.target.value)}
-            className="bg-transparent px-1.5 py-1 text-xs placeholder-neutral-500 focus:outline-none w-12 text-center border-r border-neutral-700/50 shrink-0"
-          />
-          <input
-            type="text"
-            placeholder="Utilisateur"
-            value={quickUser}
-            onChange={(e) => setQuickUser(e.target.value)}
-            className="bg-transparent px-2.5 py-1 text-xs placeholder-neutral-500 focus:outline-none flex-1 min-w-[80px] border-r border-neutral-700/50"
-          />
-          <input
-            type="password"
-            placeholder="Mot de passe"
-            value={quickPass}
-            onChange={(e) => setQuickPass(e.target.value)}
-            className="bg-transparent px-2.5 py-1 text-xs placeholder-neutral-500 focus:outline-none flex-1 min-w-[80px]"
-          />
-        </div>
-
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="hidden xl:flex items-center gap-2 text-[11px] font-medium text-neutral-400 mr-1">
-            <span
-              className={`h-2 w-2 rounded-full transition-all ${
-                activeTab.isConnected ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]" : "bg-neutral-500"
-              }`}
-            />
-            <span>{activeTab.isConnected ? "En ligne" : "Déconnecté"}</span>
-          </div>
-
-          {activeTab.isConnected ? (
-            <button
-              onClick={() => handleDisconnect(activeTab.id)}
-              className="flex items-center gap-1.5 rounded bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white shadow hover:bg-rose-500 active:scale-95 cursor-pointer transition duration-150"
-              title="Déconnecter la session courante"
-            >
-              <Unplug className="h-3.5 w-3.5" />
-              <span>Déconnecter</span>
-            </button>
-          ) : (
-            <button
-              onClick={() =>
-                handleConnectRequest(
-                  "SFTP",
-                  quickHost,
-                  quickPort,
-                  quickUser,
-                  "password",
-                  quickPass
-                )
-              }
-              className="flex items-center gap-1.5 rounded bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white shadow hover:bg-sky-500 active:scale-95 cursor-pointer transition duration-150"
-            >
-              <Server className="h-3.5 w-3.5" />
-              <span>Connecter</span>
-            </button>
-          )}
-        </div>
-      </header>
-
-      {/* Barre d'onglets (Multi-sessions) */}
-      <div
-        className={`flex items-center border-b px-2 gap-1 overflow-x-auto select-none ${
-          isDark ? "border-neutral-800 bg-neutral-950 text-neutral-300" : "border-neutral-300 bg-neutral-200 text-neutral-800"
-        }`}
-      >
-        {tabs.map((tab) => {
-          const isActive = tab.id === activeTabId;
-          const isEditing = editingTabId === tab.id;
-          const isDropTarget = dragOverTabId === tab.id;
-
-          return (
-            <div
-              key={tab.id}
-              onClick={() => setActiveTabId(tab.id)}
-              onDoubleClick={(e) => handleStartRenameTab(tab, e)}
-              onDragOver={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (draggedItem && draggedItem.fromSessionId !== tab.id) {
-                  setDragOverTabId(tab.id);
-                }
-              }}
-              onDragLeave={() => setDragOverTabId(null)}
-              onDrop={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setDragOverTabId(null);
-                if (draggedItem && tab.isConnected) {
-                  if (skipCrossTabConfirm) {
-                    checkAndEnqueueTransfer(
-                      draggedItem.entry.name,
-                      draggedItem.entry.path,
-                      tab.remotePath,
-                      "upload",
-                      draggedItem.entry.is_dir,
-                      tab.id
-                    );
-                  } else {
-                    setCrossTabModal({
-                      item: draggedItem,
-                      targetTab: tab,
-                      neverAskAgain: false,
-                    });
-                  }
-                }
-              }}
-              className={`group flex items-center gap-2 px-3 py-1.5 text-xs font-medium cursor-pointer border-b-2 transition-all duration-150 ${
-                isDropTarget
-                  ? "border-sky-400 bg-sky-500/20 text-sky-300 ring-2 ring-sky-400 animate-pulse"
-                  : isActive
-                  ? isDark
-                    ? "border-sky-500 bg-neutral-800/80 text-sky-400 font-semibold"
-                    : "border-sky-600 bg-white text-sky-700 font-bold shadow-xs"
-                  : isDark
-                  ? "border-transparent text-neutral-400 hover:bg-neutral-800/40 hover:text-neutral-200"
-                  : "border-transparent text-neutral-600 hover:bg-neutral-300/60 hover:text-neutral-900"
-              }`}
-              title="Double-cliquez pour renommer, ou déposez un fichier ici pour transférer vers ce serveur"
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full transition-colors ${
-                  tab.isConnected ? "bg-emerald-400" : "bg-neutral-500"
-                }`}
-              />
-
-              {isEditing ? (
-                <input
-                  type="text"
-                  autoFocus
-                  value={editingTabTitle}
-                  onChange={(e) => setEditingTabTitle(e.target.value)}
-                  onBlur={handleFinishRenameTab}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleFinishRenameTab();
-                    if (e.key === "Escape") setEditingTabId(null);
-                  }}
-                  className="bg-neutral-900 border border-sky-500 rounded px-1.5 py-0.5 text-xs text-white focus:outline-none w-28"
-                />
-              ) : (
-                <span className="truncate max-w-[140px]">{tab.title}</span>
-              )}
-
-              {tabs.length > 1 && (
-                <button
-                  onClick={(e) => closeTab(tab.id, e)}
-                  className="rounded p-0.5 hover:bg-neutral-500/30 text-neutral-500 hover:text-rose-400 opacity-60 group-hover:opacity-100 transition"
-                  title="Fermer l'onglet (Ctrl+W)"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              )}
-            </div>
-          );
-        })}
-
-        <button
-          onClick={createNewTab}
-          className="p-1.5 rounded hover:bg-neutral-800 text-neutral-400 hover:text-white cursor-pointer ml-1 transition"
-          title="Nouvel onglet (Ctrl+T)"
-        >
-          <Plus className="h-3.5 w-3.5" />
-        </button>
-      </div>
+      {/* Barre d'onglets multi-sessions */}
+      <SessionTabs
+        isDark={isDark}
+        tabs={tabs}
+        activeTabId={activeTabId}
+        setActiveTabId={setActiveTabId}
+        dragOverTabId={dragOverTabId}
+        setDragOverTabId={setDragOverTabId}
+        editingTabId={editingTabId}
+        setEditingTabId={setEditingTabId}
+        editingTabTitle={editingTabTitle}
+        setEditingTabTitle={setEditingTabTitle}
+        draggedItem={draggedItem}
+        skipCrossTabConfirm={skipCrossTabConfirm}
+        onStartRenameTab={handleStartRenameTab}
+        onFinishRenameTab={handleFinishRenameTab}
+        onCloseTab={closeTab}
+        onCreateNewTab={createNewTab}
+        onEnqueueCrossTabTransfer={enqueueCrossTabTransfer}
+        onPromptCrossTabModal={setCrossTabModal}
+      />
 
       {/* Main Split-Pane */}
       <div className="flex flex-1 overflow-hidden relative select-none">
         {/* Panneau Local */}
-        <section
-          style={{ width: `${localPaneWidth}%` }}
-          onDragOver={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            e.dataTransfer.dropEffect = "copy";
-            if (draggedItem?.from === "remote") setIsOverLocal(true);
+        <LocalPane
+          isDark={isDark}
+          localPaneWidth={localPaneWidth}
+          currentPath={currentPath}
+          files={files}
+          processedLocalFiles={processedLocalFiles}
+          drives={drives}
+          sysFolders={sysFolders}
+          isEditingLocalPath={isEditingLocalPath}
+          setIsEditingLocalPath={setIsEditingLocalPath}
+          localPathInput={localPathInput}
+          setLocalPathInput={setLocalPathInput}
+          localSearch={localSearch}
+          setLocalSearch={setLocalSearch}
+          localHistoryIndex={localHistoryIndex}
+          localSort={localSort}
+          setLocalSort={setLocalSort}
+          showTreePanels={showTreePanels}
+          treeHeight={treeHeight}
+          setTreeHeight={setTreeHeight}
+          showHidden={showHidden}
+          selectedLocalPaths={selectedLocalPaths}
+          setSelectedLocalPaths={setSelectedLocalPaths}
+          selectedRemotePaths={selectedRemotePaths}
+          activeTab={activeTab}
+          draggedItem={draggedItem}
+          setDraggedItem={setDraggedItem}
+          isOverLocal={isOverLocal}
+          setIsOverLocal={setIsOverLocal}
+          setIsOverRemote={setIsOverRemote}
+          setDragOverTabId={setDragOverTabId}
+          setActivePane={setActivePane}
+          onNavigateLocal={loadLocalDirectory}
+          onLocalHistoryBack={handleLocalHistoryBack}
+          onLocalHistoryForward={handleLocalHistoryForward}
+          onCheckAndEnqueueTransfer={checkAndEnqueueTransfer}
+          onOpenContextMenu={(e, entry, isRemote) => {
+            setContextMenu({ x: e.clientX, y: e.clientY, entry, isRemote });
           }}
-          onDragEnter={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (draggedItem?.from === "remote") setIsOverLocal(true);
-          }}
-          onDragLeave={(e) => {
-            e.preventDefault();
-            if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsOverLocal(false);
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            setIsOverLocal(false);
-            if (draggedItem && draggedItem.from === "remote") {
-              checkAndEnqueueTransfer(
-                draggedItem.entry.name,
-                draggedItem.entry.path,
-                currentPath,
-                "download",
-                draggedItem.entry.is_dir
-              );
-              setDraggedItem(null);
-            }
-          }}
-          className={`flex flex-col border-r relative transition ${
-            isDark ? "border-neutral-800 bg-neutral-950 text-neutral-200" : "border-neutral-300 bg-white text-neutral-900"
-          } ${isOverLocal ? "outline outline-2 outline-emerald-500 bg-emerald-500/10" : ""}`}
-        >
-          {/* En-tête Local */}
-          <div
-            className={`flex items-center justify-between border-b px-3 py-1.5 gap-2 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-neutral-100 text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center gap-1.5 min-w-0 flex-1">
-              <HardDrive className="h-4 w-4 text-emerald-500 shrink-0" />
-
-              {/* Sélecteur de volume */}
-              {drives.length > 0 && (
-                <select
-                  value={
-                    drives.find((d) => currentPath.toUpperCase().startsWith(d.toUpperCase())) || drives[0]
-                  }
-                  onChange={(e) => loadLocalDirectory(e.target.value)}
-                  className={`rounded border px-1.5 py-0.5 text-[11px] font-mono focus:outline-none cursor-pointer shrink-0 transition ${
-                    isDark
-                      ? "bg-neutral-950 border-neutral-700 text-sky-400 font-semibold"
-                      : "bg-white border-neutral-300 text-sky-700 font-semibold"
-                  }`}
-                  title="Changer de volume / partition"
-                >
-                  {drives.map((d) => (
-                    <option key={d} value={d}>
-                      {d}
-                    </option>
-                  ))}
-                </select>
-              )}
-
-              {/* Raccourcis compacts */}
-              <div className="hidden sm:flex items-center gap-1 border-l border-neutral-700/50 pl-1.5 shrink-0">
-                {sysFolders.desktop && (
-                  <button
-                    onClick={() => loadLocalDirectory(sysFolders.desktop)}
-                    className="p-1 rounded border border-neutral-700/60 hover:bg-neutral-800 text-neutral-400 hover:text-sky-400 cursor-pointer transition active:scale-95"
-                    title={`Bureau (${sysFolders.desktop})`}
-                  >
-                    <Monitor className="h-3.5 w-3.5" />
-                  </button>
-                )}
-                {sysFolders.downloads && (
-                  <button
-                    onClick={() => loadLocalDirectory(sysFolders.downloads)}
-                    className="p-1 rounded border border-neutral-700/60 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400 cursor-pointer transition active:scale-95"
-                    title={`Téléchargements (${sysFolders.downloads})`}
-                  >
-                    <FolderDown className="h-3.5 w-3.5" />
-                  </button>
-                )}
-                {sysFolders.documents && (
-                  <button
-                    onClick={() => loadLocalDirectory(sysFolders.documents)}
-                    className="p-1 rounded border border-neutral-700/60 hover:bg-neutral-800 text-neutral-400 hover:text-amber-400 cursor-pointer transition active:scale-95"
-                    title={`Documents (${sysFolders.documents})`}
-                  >
-                    <FileSpreadsheet className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
-
-              {/* Chemin éditable */}
-              {isEditingLocalPath ? (
-                <input
-                  type="text"
-                  autoFocus
-                  value={localPathInput}
-                  onChange={(e) => setLocalPathInput(e.target.value)}
-                  onBlur={() => {
-                    setIsEditingLocalPath(false);
-                    setLocalPathInput(currentPath);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      setIsEditingLocalPath(false);
-                      if (localPathInput.trim()) {
-                        loadLocalDirectory(localPathInput.trim());
-                      }
-                    } else if (e.key === "Escape") {
-                      setIsEditingLocalPath(false);
-                      setLocalPathInput(currentPath);
-                    }
-                  }}
-                  className={`flex-1 rounded border px-2 py-0.5 text-xs font-mono focus:outline-none transition ${
-                    isDark ? "bg-neutral-950 border-emerald-500 text-emerald-300" : "bg-white border-emerald-500 text-emerald-700 font-semibold"
-                  }`}
-                  placeholder="C:\Dossier"
-                />
-              ) : (
-                <div
-                  onClick={() => {
-                    setLocalPathInput(currentPath);
-                    setIsEditingLocalPath(true);
-                  }}
-                  className={`flex items-center gap-1.5 px-2 py-0.5 rounded cursor-pointer border border-transparent hover:border-neutral-700/60 transition truncate flex-1 min-w-0 ${
-                    isDark ? "hover:bg-neutral-800/60" : "hover:bg-neutral-200"
-                  }`}
-                  title="Cliquer pour taper un chemin local au clavier"
-                >
-                  <span className={`text-xs font-semibold font-mono truncate ${isDark ? "text-neutral-200" : "text-neutral-900"}`}>
-                    {currentPath}
-                  </span>
-                  <Edit2 className="h-3 w-3 text-neutral-500 opacity-60 shrink-0" />
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center gap-1.5 shrink-0">
-              <div className="relative">
-                <Search className="h-3 w-3 absolute left-2 top-2 text-neutral-500" />
-                <input
-                  type="text"
-                  placeholder="Filtrer..."
-                  value={localSearch}
-                  onChange={(e) => setLocalSearch(e.target.value)}
-                  className={`h-6 w-20 sm:w-28 rounded border pl-7 pr-2 text-[11px] focus:outline-none transition ${
-                    isDark ? "bg-neutral-950 border-neutral-800 text-neutral-100" : "bg-white border-neutral-300 text-neutral-900"
-                  }`}
-                />
-              </div>
-              <button
-                onClick={() => {
-                  const sep = currentPath.includes("/") ? "/" : "\\";
-                  const parts = currentPath.split(sep).filter(Boolean);
-                  parts.pop();
-                  loadLocalDirectory(parts.join(sep) || (drives[0] || "C:\\"));
-                }}
-                className="rounded p-1 hover:bg-neutral-500/20 cursor-pointer transition active:scale-95"
-                title="Dossier parent"
-              >
-                <ArrowUp className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-
-          {/* Arborescence en arbre Local */}
-          {showTreePanels && (
-            <>
-              <div
-                style={{ height: `${treeHeight}px` }}
-                className={`border-b overflow-y-auto ${
-                  isDark ? "border-neutral-800/80 bg-neutral-950/70" : "border-neutral-200 bg-neutral-50"
-                }`}
-              >
-                <DirectoryTree
-                  isDark={isDark}
-                  isRemote={false}
-                  currentPath={currentPath || (drives[0] || "C:\\")}
-                  subFolders={files.filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith("."))).map((f) => f.name)}
-                  onNavigate={loadLocalDirectory}
-                />
-              </div>
-
-              <div
-                onMouseDown={(e) => {
-                  const startY = e.clientY;
-                  const startH = treeHeight;
-                  const onMouseMove = (ev: MouseEvent) => {
-                    setTreeHeight(Math.max(60, Math.min(300, startH + (ev.clientY - startY))));
-                  };
-                  const onMouseUp = () => {
-                    window.removeEventListener("mousemove", onMouseMove);
-                    window.removeEventListener("mouseup", onMouseUp);
-                  };
-                  window.addEventListener("mousemove", onMouseMove);
-                  window.addEventListener("mouseup", onMouseUp);
-                }}
-                className="h-1 bg-neutral-800 hover:bg-sky-500 cursor-row-resize transition"
-                title="Glisser pour redimensionner l'arbre"
-              />
-            </>
-          )}
-
-          {/* Colonnes Local */}
-          <div
-            className={`grid grid-cols-12 border-b px-3 py-1 text-[11px] font-semibold uppercase tracking-wider ${
-              isDark ? "border-neutral-800 bg-neutral-900/90 text-neutral-400" : "border-neutral-300 bg-neutral-200 text-neutral-700 font-bold"
-            }`}
-          >
-            <button
-              onClick={() =>
-                setLocalSort({
-                  field: "name",
-                  order: localSort.field === "name" && localSort.order === "asc" ? "desc" : "asc",
-                })
-              }
-              className="col-span-8 flex items-center gap-1 text-left hover:text-neutral-300 cursor-pointer"
-            >
-              <span>Nom de fichier</span>
-              {localSort.field === "name" && <ArrowUpDown className="h-2.5 w-2.5 text-sky-500" />}
-            </button>
-            <button
-              onClick={() =>
-                setLocalSort({
-                  field: "size",
-                  order: localSort.field === "size" && localSort.order === "asc" ? "desc" : "asc",
-                })
-              }
-              className="col-span-3 flex items-center justify-end gap-1 text-right hover:text-neutral-300 cursor-pointer"
-            >
-              <span>Taille</span>
-              {localSort.field === "size" && <ArrowUpDown className="h-2.5 w-2.5 text-sky-500" />}
-            </button>
-            <span className="col-span-1 text-center">Action</span>
-          </div>
-
-          {/* Liste des fichiers locaux */}
-          <div className="flex-1 overflow-y-auto font-mono text-xs divide-y divide-neutral-500/10">
-            {processedLocalFiles.map((item, index) => {
-              const badge = getFileBadge(item.name, isDark);
-              return (
-                <div
-                  key={index}
-                  draggable
-                  onDragStart={(e) => {
-                    setDraggedItem({ entry: item, from: "local" });
-                    e.dataTransfer.setData("text/plain", item.path);
-                    e.dataTransfer.effectAllowed = "copyMove";
-                  }}
-                  onDragEnd={() => {
-                    setDraggedItem(null);
-                    setIsOverRemote(false);
-                    setIsOverLocal(false);
-                    setDragOverTabId(null);
-                  }}
-                  onDoubleClick={() => {
-                    if (item.is_dir) {
-                      loadLocalDirectory(item.path);
-                    } else {
-                      if (!activeTab.isConnected) {
-                        logMessage("Info : Connectez-vous d'abord à un serveur distant pour transférer.");
-                        return;
-                      }
-                      checkAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
-                    }
-                  }}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setContextMenu({ x: e.clientX, y: e.clientY, entry: item, isRemote: false });
-                  }}
-                  className="grid grid-cols-12 items-center px-3 py-1.5 hover:bg-sky-500/10 cursor-pointer group transition duration-100"
-                >
-                  <div className="col-span-8 flex items-center gap-2 truncate pr-2">
-                    {item.is_dir ? (
-                      <Folder className="h-4 w-4 text-amber-500 shrink-0" />
-                    ) : (
-                      badge.icon
-                    )}
-                    <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
-                      {item.name}
-                    </span>
-                  </div>
-
-                  <div className="col-span-3 text-right text-[11px] text-neutral-500 font-sans">
-                    {!item.is_dir ? `${(item.size / 1024).toFixed(1)} Ko` : "--"}
-                  </div>
-
-                  <div className="col-span-1 flex justify-center">
-                    {activeTab.isConnected && !item.is_dir && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          checkAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
-                        }}
-                        className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-sky-500 cursor-pointer transition active:scale-95"
-                        title="Envoyer vers le serveur"
-                      >
-                        <Upload className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-        {/* Splitter vertical */}
-        <div
-          onMouseDown={(e) => {
-            const container = e.currentTarget.parentElement;
-            if (!container) return;
-            const containerRect = container.getBoundingClientRect();
-            const onMouseMove = (ev: MouseEvent) => {
-              const relX = ev.clientX - containerRect.left;
-              const newPercent = Math.max(20, Math.min(80, (relX / containerRect.width) * 100));
-              setLocalPaneWidth(newPercent);
-            };
-            const onMouseUp = () => {
-              window.removeEventListener("mousemove", onMouseMove);
-              window.removeEventListener("mouseup", onMouseUp);
-            };
-            window.addEventListener("mousemove", onMouseMove);
-            window.addEventListener("mouseup", onMouseUp);
-          }}
-          className="w-1.5 bg-neutral-800 hover:bg-sky-500 cursor-col-resize transition-colors duration-150 z-10 shrink-0"
-          title="Glisser pour ajuster la largeur local / distant"
+          onPromptInputModal={setInputModal}
+          logMessage={logMessage}
         />
 
         {/* Panneau Distant */}
-        <section
-          style={{ width: `${100 - localPaneWidth}%` }}
-          onDragOver={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            e.dataTransfer.dropEffect = "copy";
-            if (draggedItem?.from === "local" || !draggedItem) setIsOverRemote(true);
+        <RemotePane
+          isDark={isDark}
+          localPaneWidth={localPaneWidth}
+          setLocalPaneWidth={setLocalPaneWidth}
+          activeTab={activeTab}
+          processedRemoteFiles={processedRemoteFiles}
+          bookmarks={bookmarks}
+          setBookmarks={setBookmarks}
+          showBookmarksMenu={showBookmarksMenu}
+          setShowBookmarksMenu={setShowBookmarksMenu}
+          isEditingRemotePath={isEditingRemotePath}
+          setIsEditingRemotePath={setIsEditingRemotePath}
+          remotePathInput={remotePathInput}
+          setRemotePathInput={setRemotePathInput}
+          remoteSearch={remoteSearch}
+          setRemoteSearch={setRemoteSearch}
+          remoteSort={remoteSort}
+          setRemoteSort={setRemoteSort}
+          showTreePanels={showTreePanels}
+          treeHeight={treeHeight}
+          setTreeHeight={setTreeHeight}
+          showHidden={showHidden}
+          selectedRemotePaths={selectedRemotePaths}
+          setSelectedRemotePaths={setSelectedRemotePaths}
+          selectedLocalPaths={selectedLocalPaths}
+          files={files}
+          currentPath={currentPath}
+          draggedItem={draggedItem}
+          setDraggedItem={setDraggedItem}
+          isOverRemote={isOverRemote}
+          setIsOverRemote={setIsOverRemote}
+          setIsOverLocal={setIsOverLocal}
+          setDragOverTabId={setDragOverTabId}
+          setActivePane={setActivePane}
+          onNavigateRemote={loadRemoteDirectory}
+          onRemoteHistoryBack={handleRemoteHistoryBack}
+          onRemoteHistoryForward={handleRemoteHistoryForward}
+          onCheckAndEnqueueTransfer={checkAndEnqueueTransfer}
+          onOpenContextMenu={(e, entry, isRemote) => {
+            setContextMenu({ x: e.clientX, y: e.clientY, entry, isRemote });
           }}
-          onDragEnter={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (draggedItem?.from === "local" || !draggedItem) setIsOverRemote(true);
-          }}
-          onDragLeave={(e) => {
-            e.preventDefault();
-            if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsOverRemote(false);
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            setIsOverRemote(false);
-            if (draggedItem && draggedItem.from === "local") {
-              if (!activeTab.isConnected) {
-                logMessage("Erreur : Impossible d'envoyer, serveur déconnecté.");
-                setDraggedItem(null);
-                return;
-              }
-              checkAndEnqueueTransfer(
-                draggedItem.entry.name,
-                draggedItem.entry.path,
-                activeTab.remotePath,
-                "upload",
-                draggedItem.entry.is_dir
-              );
-              setDraggedItem(null);
-            }
-          }}
-          className={`flex flex-col relative transition ${
-            isDark ? "bg-neutral-950 text-neutral-200" : "bg-white text-neutral-900"
-          } ${isOverRemote ? "outline outline-2 outline-sky-500 bg-sky-500/10" : ""}`}
-        >
-          {/* En-tête Distant */}
-          <div
-            className={`flex items-center justify-between border-b px-3 py-1.5 gap-2 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-neutral-100 text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center gap-1.5 flex-1 min-w-0">
-              <Server className="h-4 w-4 text-sky-500 shrink-0" />
-
-              {/* Menu Favoris */}
-              <div className="relative shrink-0" ref={bookmarksRef}>
-                <button
-                  onClick={() => setShowBookmarksMenu(!showBookmarksMenu)}
-                  className={`p-1 rounded hover:bg-neutral-500/20 cursor-pointer transition active:scale-95 ${
-                    bookmarks.includes(activeTab.remotePath) ? "text-amber-400" : "text-neutral-400 hover:text-amber-400"
-                  }`}
-                  title="Favoris / Dossiers rapides"
-                >
-                  <Star className="h-3.5 w-3.5 fill-current" />
-                </button>
-
-                {showBookmarksMenu && (
-                  <div
-                    className={`absolute left-0 mt-1 w-64 rounded-lg border py-1 shadow-2xl z-50 text-xs animate-in fade-in zoom-in-95 duration-150 backdrop-blur-md ${
-                      isDark ? "bg-neutral-900/95 border-neutral-700 text-neutral-200" : "bg-white/95 border-neutral-300 text-neutral-800"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between px-3 py-1 border-b border-neutral-700/50 font-semibold text-[11px] text-neutral-400">
-                      <span>Dossiers favoris</span>
-                      {activeTab.isConnected && (
-                        <button
-                          onClick={() => {
-                            if (!bookmarks.includes(activeTab.remotePath)) {
-                              setBookmarks([...bookmarks, activeTab.remotePath]);
-                            }
-                            setShowBookmarksMenu(false);
-                          }}
-                          className="text-sky-400 hover:text-sky-300 cursor-pointer transition"
-                        >
-                          + Ajouter actif
-                        </button>
-                      )}
-                    </div>
-                    <div className="max-h-48 overflow-y-auto">
-                      {bookmarks.length === 0 ? (
-                        <div className="px-3 py-2 text-neutral-500 text-[11px]">Aucun favori enregistré</div>
-                      ) : (
-                        bookmarks.map((bPath) => (
-                          <div
-                            key={bPath}
-                            className="flex items-center justify-between px-3 py-1.5 hover:bg-neutral-500/15 cursor-pointer transition"
-                            onClick={() => {
-                              if (activeTab.isConnected) loadRemoteDirectory(bPath);
-                              setShowBookmarksMenu(false);
-                            }}
-                          >
-                            <span className="truncate font-mono text-[11px] text-sky-400">{bPath}</span>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setBookmarks(bookmarks.filter((b) => b !== bPath));
-                              }}
-                              className="text-neutral-500 hover:text-rose-400 p-0.5 ml-2 cursor-pointer transition"
-                              title="Retirer des favoris"
-                            >
-                              <X className="h-3 w-3" />
-                            </button>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Chemin distant éditable */}
-              {isEditingRemotePath ? (
-                <input
-                  type="text"
-                  autoFocus
-                  value={remotePathInput}
-                  onChange={(e) => setRemotePathInput(e.target.value)}
-                  onBlur={() => {
-                    setIsEditingRemotePath(false);
-                    setRemotePathInput(activeTab.remotePath);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      setIsEditingRemotePath(false);
-                      if (activeTab.isConnected && remotePathInput.trim()) {
-                        loadRemoteDirectory(remotePathInput.trim());
-                      }
-                    } else if (e.key === "Escape") {
-                      setIsEditingRemotePath(false);
-                      setRemotePathInput(activeTab.remotePath);
-                    }
-                  }}
-                  className={`flex-1 rounded border px-2 py-0.5 text-xs font-mono focus:outline-none transition ${
-                    isDark ? "bg-neutral-950 border-sky-500 text-sky-300" : "bg-white border-sky-500 text-sky-700 font-semibold"
-                  }`}
-                  placeholder="/chemin/distant"
-                />
-              ) : (
-                <div
-                  onClick={() => {
-                    if (activeTab.isConnected) {
-                      setRemotePathInput(activeTab.remotePath);
-                      setIsEditingRemotePath(true);
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 px-2 py-0.5 rounded cursor-pointer border border-transparent hover:border-neutral-700/60 transition truncate flex-1 min-w-0 ${
-                    isDark ? "hover:bg-neutral-800/60" : "hover:bg-neutral-200"
-                  }`}
-                  title="Cliquer pour taper un chemin distant au clavier"
-                >
-                  <span className={`text-xs font-semibold font-mono truncate ${isDark ? "text-neutral-200" : "text-neutral-900"}`}>
-                    {activeTab.remotePath}
-                  </span>
-                  <Edit2 className="h-3 w-3 text-neutral-500 opacity-60 shrink-0" />
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center gap-1.5 shrink-0">
-              <div className="relative">
-                <Search className="h-3 w-3 absolute left-2 top-2 text-neutral-500" />
-                <input
-                  type="text"
-                  placeholder="Filtrer..."
-                  value={remoteSearch}
-                  onChange={(e) => setRemoteSearch(e.target.value)}
-                  className={`h-6 w-24 sm:w-28 rounded border pl-7 pr-2 text-[11px] focus:outline-none transition ${
-                    isDark ? "bg-neutral-950 border-neutral-800 text-neutral-100" : "bg-white border-neutral-300 text-neutral-900"
-                  }`}
-                />
-              </div>
-              {activeTab.isConnected && (
-                <>
-                  <button
-                    onClick={() => {
-                      const parts = activeTab.remotePath.split("/").filter(Boolean);
-                      parts.pop();
-                      loadRemoteDirectory("/" + parts.join("/"));
-                    }}
-                    className="rounded p-1 hover:bg-neutral-500/20 cursor-pointer transition active:scale-95"
-                    title="Dossier parent"
-                  >
-                    <ArrowUp className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      setInputModal({
-                        title: "Nouveau dossier distant",
-                        label: "Nom du dossier :",
-                        value: "nouveau_dossier",
-                        onConfirm: async (val) => {
-                          const sep = activeTab.remotePath.endsWith("/") ? "" : "/";
-                          await invoke("create_remote_dir", {
-                            sessionId: activeTab.id,
-                            path: `${activeTab.remotePath}${sep}${val}`,
-                          });
-                          logMessage(`MKD ${activeTab.remotePath}${sep}${val}`);
-                          loadRemoteDirectory(activeTab.remotePath);
-                        },
-                      });
-                    }}
-                    className="rounded p-1 hover:bg-neutral-500/20 cursor-pointer transition active:scale-95"
-                    title="Nouveau dossier distant"
-                  >
-                    <FolderPlus className="h-3.5 w-3.5" />
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Arborescence en arbre Distante */}
-          {showTreePanels && (
-            <>
-              <div
-                style={{ height: `${treeHeight}px` }}
-                className={`border-b overflow-y-auto ${
-                  isDark ? "border-neutral-800/80 bg-neutral-950/70" : "border-neutral-200 bg-neutral-50"
-                }`}
-              >
-                {activeTab.isConnected ? (
-                  <DirectoryTree
-                    sessionId={activeTab.id}
-                    isDark={isDark}
-                    isRemote={true}
-                    currentPath={activeTab.remotePath}
-                    subFolders={activeTab.remoteFiles.filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith("."))).map((f) => f.name)}
-                    onNavigate={loadRemoteDirectory}
-                  />
-                ) : (
-                  <div className="p-3 text-neutral-500 text-xs">Serveur déconnecté</div>
-                )}
-              </div>
-
-              <div
-                onMouseDown={(e) => {
-                  const startY = e.clientY;
-                  const startH = treeHeight;
-                  const onMouseMove = (ev: MouseEvent) => {
-                    setTreeHeight(Math.max(60, Math.min(300, startH + (ev.clientY - startY))));
-                  };
-                  const onMouseUp = () => {
-                    window.removeEventListener("mousemove", onMouseMove);
-                    window.removeEventListener("mouseup", onMouseUp);
-                  };
-                  window.addEventListener("mousemove", onMouseMove);
-                  window.addEventListener("mouseup", onMouseUp);
-                }}
-                className="h-1 bg-neutral-800 hover:bg-sky-500 cursor-row-resize transition"
-                title="Glisser pour redimensionner l'arbre"
-              />
-            </>
-          )}
-
-          {/* Colonnes Distant */}
-          <div
-            className={`grid grid-cols-12 border-b px-3 py-1 text-[11px] font-semibold uppercase tracking-wider ${
-              isDark ? "border-neutral-800 bg-neutral-900/90 text-neutral-400" : "border-neutral-300 bg-neutral-200 text-neutral-700 font-bold"
-            }`}
-          >
-            <button
-              onClick={() =>
-                setRemoteSort({
-                  field: "name",
-                  order: remoteSort.field === "name" && remoteSort.order === "asc" ? "desc" : "asc",
-                })
-              }
-              className="col-span-6 flex items-center gap-1 text-left hover:text-neutral-300 cursor-pointer"
-            >
-              <span>Nom de fichier</span>
-              {remoteSort.field === "name" && <ArrowUpDown className="h-2.5 w-2.5 text-sky-500" />}
-            </button>
-            <span className="col-span-2 text-center hidden sm:inline">Droits</span>
-            <button
-              onClick={() =>
-                setRemoteSort({
-                  field: "size",
-                  order: remoteSort.field === "size" && remoteSort.order === "asc" ? "desc" : "asc",
-                })
-              }
-              className="col-span-5 sm:col-span-3 flex items-center justify-end gap-1 text-right hover:text-neutral-300 cursor-pointer"
-            >
-              <span>Taille</span>
-              {remoteSort.field === "size" && <ArrowUpDown className="h-2.5 w-2.5 text-sky-500" />}
-            </button>
-            <span className="col-span-1 text-center">Action</span>
-          </div>
-
-          {/* Liste des fichiers distants */}
-          <div className="flex-1 overflow-y-auto font-mono text-xs divide-y divide-neutral-500/10">
-            {!activeTab.isConnected ? (
-              <div className="flex h-full flex-col items-center justify-center text-xs text-neutral-500 gap-2 font-sans">
-                <Server className="h-8 w-8 text-neutral-500" />
-                <span>Absence de connexion à un serveur</span>
-              </div>
-            ) : (
-              processedRemoteFiles.map((item, index) => {
-                const badge = getFileBadge(item.name, isDark);
-                return (
-                  <div
-                    key={index}
-                    draggable
-                    onDragStart={(e) => {
-                      setDraggedItem({ entry: item, from: "remote", fromSessionId: activeTab.id });
-                      e.dataTransfer.setData("text/plain", item.path);
-                      e.dataTransfer.effectAllowed = "copyMove";
-                    }}
-                    onDragEnd={() => {
-                      setDraggedItem(null);
-                      setIsOverRemote(false);
-                      setIsOverLocal(false);
-                      setDragOverTabId(null);
-                    }}
-                    onDoubleClick={() => {
-                      if (item.is_dir) {
-                        loadRemoteDirectory(item.path);
-                      } else {
-                        checkAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
-                      }
-                    }}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setContextMenu({ x: e.clientX, y: e.clientY, entry: item, isRemote: true });
-                    }}
-                    className="grid grid-cols-12 items-center px-3 py-1.5 hover:bg-sky-500/10 cursor-pointer group transition duration-100"
-                  >
-                    <div className="col-span-6 flex items-center gap-2 truncate pr-2">
-                      {item.is_dir ? (
-                        <Folder className="h-4 w-4 text-sky-500 shrink-0" />
-                      ) : (
-                        badge.icon
-                      )}
-                      <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
-                        {item.name}
-                      </span>
-                    </div>
-
-                    <div className="col-span-2 text-center text-[10px] text-neutral-500 font-mono hidden sm:inline">
-                      {item.permissions ? `0${(item.permissions & 0o777).toString(8)}` : "--"}
-                    </div>
-
-                    <div className="col-span-5 sm:col-span-3 text-right text-[11px] text-neutral-500 font-sans">
-                      {!item.is_dir ? `${(item.size / 1024).toFixed(1)} Ko` : "--"}
-                    </div>
-
-                    <div className="col-span-1 flex justify-center gap-1">
-                      {!item.is_dir && (
-                        <>
-                          <button
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              logMessage(`Téléchargement temporaire et ouverture de "${item.name}"...`);
-                              try {
-                                const tempPath = await invoke<string>("open_remote_with_system", {
-                                  sessionId: activeTab.id,
-                                  remotePath: item.path,
-                                });
-                                logMessage(`Fichier ouvert : ${tempPath}`);
-                              } catch (err) {
-                                logMessage(`Erreur d'ouverture : ${err}`);
-                              }
-                            }}
-                            className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-amber-500 cursor-pointer transition active:scale-95"
-                            title="Ouvrir avec Windows"
-                          >
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </button>
-
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              checkAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
-                            }}
-                            className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-emerald-500 cursor-pointer transition active:scale-95"
-                            title="Télécharger"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </section>
+          onPromptInputModal={setInputModal}
+          logMessage={logMessage}
+        />
       </div>
 
-      {/* Splitter console du bas */}
-      <div
-        onMouseDown={(e) => {
-          const startY = e.clientY;
-          const startH = bottomHeight;
-          const onMouseMove = (ev: MouseEvent) => {
-            setBottomHeight(Math.max(100, Math.min(500, startH - (ev.clientY - startY))));
-          };
-          const onMouseUp = () => {
-            window.removeEventListener("mousemove", onMouseMove);
-            window.removeEventListener("mouseup", onMouseUp);
-          };
-          window.addEventListener("mousemove", onMouseMove);
-          window.addEventListener("mouseup", onMouseUp);
-        }}
-        className="h-1 bg-neutral-800 hover:bg-sky-500 cursor-row-resize transition"
-        title="Glisser pour redimensionner la console inférieure"
+      {/* Panneau Inférieur (Console / File d'attente / Terminal SSH) */}
+      <BottomPanel
+        isDark={isDark}
+        bottomHeight={bottomHeight}
+        setBottomHeight={setBottomHeight}
+        bottomOpen={bottomOpen}
+        setBottomOpen={setBottomOpen}
+        activeBottomTab={activeBottomTab}
+        setActiveBottomTab={setActiveBottomTab}
+        enableSshTerminal={enableSshTerminal}
+        activeTab={activeTab}
+        logs={logs}
       />
 
-      {/* Console inférieure */}
-      <footer
-        style={{ height: bottomOpen ? `${bottomHeight}px` : "32px" }}
-        className={`border-t flex flex-col transition-all duration-150 ${
-          isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-neutral-100 text-neutral-800"
-        }`}
-      >
-        <div
-          className={`flex items-center justify-between border-b px-4 h-8 text-xs font-semibold select-none ${
-            isDark ? "border-neutral-800 bg-neutral-950 text-neutral-200" : "border-neutral-300 bg-neutral-200 text-neutral-800"
-          }`}
-        >
-          <div className="flex gap-4">
-            <button
-              onClick={() => {
-                setActiveBottomTab("queue");
-                setBottomOpen(true);
-              }}
-              className={`flex items-center gap-1.5 py-1 cursor-pointer transition ${
-                activeBottomTab === "queue" && bottomOpen ? "text-sky-500 font-bold" : "text-neutral-500 hover:text-neutral-300"
-              }`}
-            >
-              <ListOrdered className="h-3.5 w-3.5" />
-              <span>Fichiers en file d'attente ({queue.filter((q) => q.status === "queued" || q.status === "running").length})</span>
-            </button>
-            <button
-              onClick={() => {
-                setActiveBottomTab("logs");
-                setBottomOpen(true);
-              }}
-              className={`flex items-center gap-1.5 py-1 cursor-pointer transition ${
-                activeBottomTab === "logs" && bottomOpen ? "text-sky-500 font-bold" : "text-neutral-500 hover:text-neutral-300"
-              }`}
-            >
-              <TerminalIcon className="h-3.5 w-3.5" />
-              <span>Journal de commandes</span>
-            </button>
-            {enableSshTerminal && (
-              <button
-                onClick={() => {
-                  setActiveBottomTab("terminal");
-                  setBottomOpen(true);
-                }}
-                className={`flex items-center gap-1.5 py-1 cursor-pointer transition ${
-                  activeBottomTab === "terminal" && bottomOpen ? "text-sky-500 font-bold" : "text-neutral-500 hover:text-neutral-300"
-                }`}
-              >
-                <TerminalIcon className="h-3.5 w-3.5 text-emerald-500" />
-                <span>Terminal SSH ({activeTab.title})</span>
-              </button>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2">
-            {activeBottomTab === "queue" && (
-              <>
-                <button
-                  onClick={retryAllFailed}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-amber-400 hover:text-amber-300 cursor-pointer transition active:scale-95"
-                  title="Relancer tous les transferts échoués ou annulés"
-                >
-                  <RotateCcw className="h-3 w-3" />
-                  <span>Relancer échecs</span>
-                </button>
-                <button
-                  onClick={clearDone}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-neutral-400 hover:text-neutral-200 cursor-pointer transition active:scale-95"
-                  title="Vider les transferts terminés"
-                >
-                  <RotateCcw className="h-3 w-3" />
-                  <span>Vider terminé</span>
-                </button>
-                <button
-                  onClick={cancelAll}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-normal text-rose-500 hover:text-rose-400 cursor-pointer transition active:scale-95"
-                  title="Annuler tous les transferts"
-                >
-                  <Ban className="h-3 w-3" />
-                  <span>Tout annuler</span>
-                </button>
-              </>
-            )}
-
-            <button
-              onClick={() => setBottomOpen(!bottomOpen)}
-              className="p-1 text-neutral-400 hover:text-neutral-200 cursor-pointer ml-2 transition"
-              title={bottomOpen ? "Réduire" : "Agrandir"}
-            >
-              {bottomOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
-            </button>
-          </div>
-        </div>
-
-        {bottomOpen && (
-          <div className="flex-1 flex flex-col overflow-hidden relative">
-            {enableSshTerminal && (
-              <div className={`h-full w-full ${activeBottomTab === "terminal" ? "block" : "hidden"}`}>
-                <SshTerminal sessionId={activeTab.id} isConnected={activeTab.isConnected} />
-              </div>
-            )}
-
-            {activeBottomTab === "logs" && (
-              <div className="flex-1 overflow-y-auto p-2.5 font-mono text-[11px] space-y-1">
-                {logs.map((log, idx) => (
-                  <div key={idx} className="flex gap-2">
-                    <span className="text-neutral-500">&gt;</span>
-                    <span>{log}</span>
-                  </div>
-                ))}
-                <div ref={logsEndRef} />
-              </div>
-            )}
-
-            {activeBottomTab === "queue" && (
-              <div className="flex-1 overflow-y-auto p-2.5 font-mono text-[11px] space-y-1">
-                {queue.length === 0 ? (
-                  <div className="text-neutral-500 flex h-full items-center justify-center font-sans text-xs">
-                    File d'attente : vide
-                  </div>
-                ) : (
-                  queue.map((item) => (
-                    <div key={item.id} className="flex items-center justify-between border-b border-neutral-500/10 py-1.5 px-2">
-                      <div className="flex items-center gap-2 truncate max-w-md">
-                        {item.status === "running" && <Clock className="h-3.5 w-3.5 text-sky-500 animate-spin shrink-0" />}
-                        {item.status === "queued" && <Clock className="h-3.5 w-3.5 text-neutral-500 shrink-0" />}
-                        {item.status === "done" && <CheckCircle className="h-3.5 w-3.5 text-emerald-500 shrink-0" />}
-                        {item.status === "error" && <Ban className="h-3.5 w-3.5 text-rose-500 shrink-0" />}
-                        <span className="truncate">{item.filename}</span>
-                        <span className="text-neutral-500 shrink-0">({item.direction})</span>
-                      </div>
-                      <div className="flex items-center gap-3 shrink-0">
-                        {item.status === "running" && (
-                          <>
-                            <span className="text-emerald-500 font-semibold">{item.speed}</span>
-                            <span className="text-neutral-400">ETA: {item.eta}</span>
-                            <span className="text-sky-500">{item.percent.toFixed(0)}%</span>
-                            <button
-                              onClick={cancelAll}
-                              className="px-2 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-[10px] text-white cursor-pointer transition active:scale-95"
-                            >
-                              Annuler
-                            </button>
-                          </>
-                        )}
-                        {item.status === "queued" && <span className="text-neutral-500">En attente...</span>}
-                        {item.status === "done" && <span className="text-emerald-400">Terminé</span>}
-                        {item.status === "error" && (
-                          <div className="flex items-center gap-2">
-                            <span className="text-rose-400">Échec</span>
-                            <button
-                              onClick={() => retryItem(item.id)}
-                              className="flex items-center gap-1 px-2 py-0.5 rounded bg-amber-600/80 hover:bg-amber-500 text-[10px] text-white cursor-pointer transition active:scale-95"
-                              title="Relancer ce transfert"
-                            >
-                              <RotateCcw className="h-2.5 w-2.5" />
-                              <span>Réessayer</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </footer>
-
       {/* Menu contextuel Clic Droit */}
-      {contextMenu && (
-        <div
-          style={{ top: `${Math.min(window.innerHeight - 280, contextMenu.y)}px`, left: `${Math.min(window.innerWidth - 220, contextMenu.x)}px` }}
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-          className={`fixed z-[100] min-w-56 rounded-lg border py-1 shadow-2xl text-xs backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 ${
-            isDark ? "border-neutral-800 bg-neutral-900/95 text-neutral-200" : "border-neutral-300 bg-white/95 text-neutral-800"
-          }`}
-        >
-          {contextMenu.isRemote ? (
-            <>
-              {!contextMenu.entry.is_dir && (
-                <>
-                  {isEditableTextFile(contextMenu.entry.name) && (
-                    <button
-                      onClick={async () => {
-                        const entry = contextMenu.entry;
-                        setContextMenu(null);
-                        logMessage(`Lecture de "${entry.name}" pour édition...`);
-                        try {
-                          const text = await invoke<string>("read_remote_file_text", {
-                            sessionId: activeTab.id,
-                            remotePath: entry.path,
-                          });
-                          setEditorModal({
-                            path: entry.path,
-                            filename: entry.name,
-                            content: text,
-                            originalContent: text,
-                            saving: false,
-                          });
-                        } catch (err) {
-                          logMessage(`Erreur lecture : ${err}`);
-                        }
-                      }}
-                      className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer text-sky-400"
-                    >
-                      <FileEdit className="h-3.5 w-3.5" />
-                      <span>Éditer dans Gens-RFT</span>
-                    </button>
-                  )}
-                  <button
-                    onClick={async () => {
-                      const entry = contextMenu.entry;
-                      setContextMenu(null);
-                      logMessage(`Téléchargement temporaire et ouverture de "${entry.name}"...`);
-                      try {
-                        const tempPath = await invoke<string>("open_remote_with_system", {
-                          sessionId: activeTab.id,
-                          remotePath: entry.path,
-                        });
-                        logMessage(`Fichier ouvert : ${tempPath}`);
-                      } catch (err) {
-                        logMessage(`Erreur d'ouverture : ${err}`);
-                      }
-                    }}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5 text-amber-500" />
-                    <span>Ouvrir avec Windows...</span>
-                  </button>
-                </>
-              )}
-
-              {/* Compression / Décompression distante */}
-              {isArchiveFile(contextMenu.entry.name) ? (
-                <button
-                  onClick={async () => {
-                    const entry = contextMenu.entry;
-                    setContextMenu(null);
-                    logMessage(`Extraction distante de "${entry.name}"...`);
-                    try {
-                      await invoke("extract_remote", {
-                        sessionId: activeTab.id,
-                        parentDir: activeTab.remotePath,
-                        archiveName: entry.name,
-                      });
-                      logMessage(`Archive "${entry.name}" extraite.`);
-                      loadRemoteDirectory(activeTab.remotePath);
-                    } catch (err) {
-                      logMessage(`Échec extraction distante : ${err}`);
-                    }
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer text-amber-400"
-                >
-                  <FolderArchive className="h-3.5 w-3.5" />
-                  <span>Décompresser ici</span>
-                </button>
-              ) : (
-                <button
-                  onClick={async () => {
-                    const entry = contextMenu.entry;
-                    setContextMenu(null);
-                    logMessage(`Compression de "${entry.name}" en tar.gz...`);
-                    try {
-                      const res = await invoke<string>("compress_remote", {
-                        sessionId: activeTab.id,
-                        parentDir: activeTab.remotePath,
-                        itemName: entry.name,
-                        format: "tar.gz",
-                      });
-                      logMessage(`Archive créée : ${res}`);
-                      loadRemoteDirectory(activeTab.remotePath);
-                    } catch (err) {
-                      logMessage(`Échec compression distante : ${err}`);
-                    }
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-                >
-                  <Archive className="h-3.5 w-3.5 text-amber-500" />
-                  <span>Compresser (.tar.gz)</span>
-                </button>
-              )}
-
-              <button
-                onClick={() => {
-                  checkAndEnqueueTransfer(contextMenu.entry.name, contextMenu.entry.path, currentPath, "download", contextMenu.entry.is_dir);
-                  setContextMenu(null);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-              >
-                <Download className="h-3.5 w-3.5 text-emerald-500" />
-                <span>Télécharger</span>
-              </button>
-              <button
-                onClick={async () => {
-                  const entry = contextMenu.entry;
-                  setContextMenu(null);
-                  logMessage(`Calcul de la taille pour "${entry.name}"...`);
-                  try {
-                    const out = await invoke<string>("exec_remote_command", { sessionId: activeTab.id, command: `du -sh "${entry.path}"` });
-                    logMessage(`Taille (${entry.name}) : ${out.trim()}`);
-                  } catch (err) {
-                    logMessage(`Erreur calcul taille : ${err}`);
-                  }
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-              >
-                <Calculator className="h-3.5 w-3.5 text-indigo-500" />
-                <span>Calculer la taille (du -sh)</span>
-              </button>
-              <button
-                onClick={() => {
-                  const currentOctal = contextMenu.entry.permissions
-                    ? (contextMenu.entry.permissions & 0o777).toString(8)
-                    : "755";
-                  setChmodModal({
-                    path: contextMenu.entry.path,
-                    name: contextMenu.entry.name,
-                    octal: currentOctal,
-                  });
-                  setContextMenu(null);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-              >
-                <ShieldCheck className="h-3.5 w-3.5 text-sky-500" />
-                <span>Permissions (CHMOD)</span>
-              </button>
-            </>
-          ) : (
-            <>
-              {/* Compression / Décompression locale */}
-              {isArchiveFile(contextMenu.entry.name) ? (
-                <button
-                  onClick={async () => {
-                    const entry = contextMenu.entry;
-                    setContextMenu(null);
-                    logMessage(`Extraction locale de "${entry.name}"...`);
-                    try {
-                      await invoke("extract_local", { path: entry.path });
-                      logMessage(`Archive locale extraite.`);
-                      loadLocalDirectory(currentPath);
-                    } catch (err) {
-                      logMessage(`Erreur extraction locale : ${err}`);
-                    }
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer text-amber-400"
-                >
-                  <FolderArchive className="h-3.5 w-3.5" />
-                  <span>Extraire ici (ZIP)</span>
-                </button>
-              ) : (
-                <button
-                  onClick={async () => {
-                    const entry = contextMenu.entry;
-                    setContextMenu(null);
-                    logMessage(`Compression locale de "${entry.name}"...`);
-                    try {
-                      const res = await invoke<string>("compress_local", { path: entry.path, format: "zip" });
-                      logMessage(`Archive créée : ${res}`);
-                      loadLocalDirectory(currentPath);
-                    } catch (err) {
-                      logMessage(`Erreur compression locale : ${err}`);
-                    }
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-                >
-                  <Archive className="h-3.5 w-3.5 text-amber-500" />
-                  <span>Compresser en .zip</span>
-                </button>
-              )}
-
-              <button
-                onClick={() => {
-                  checkAndEnqueueTransfer(contextMenu.entry.name, contextMenu.entry.path, activeTab.remotePath, "upload", contextMenu.entry.is_dir);
-                  setContextMenu(null);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
-              >
-                <Upload className="h-3.5 w-3.5 text-sky-500" />
-                <span>Envoyer sur le serveur actif</span>
-              </button>
-            </>
-          )}
-
-          <div className="my-1 border-t border-neutral-500/20" />
-
-          <button
-            onClick={() => {
-              const entry = contextMenu.entry;
-              const isRem = contextMenu.isRemote;
-              setContextMenu(null);
-              setConfirmModal({
-                title: "Suppression définitive",
-                message: `Supprimer "${entry.name}" ? Cette action est irréversible.`,
-                onConfirm: async () => {
-                  if (isRem) {
-                    await invoke("delete_remote", { sessionId: activeTab.id, path: entry.path, isDir: entry.is_dir });
-                    logMessage(`DELE ${entry.path}`);
-                    loadRemoteDirectory(activeTab.remotePath);
-                  } else {
-                    await invoke("delete_local", { path: entry.path, isDir: entry.is_dir });
-                    logMessage(`Suppression locale : ${entry.path}`);
-                    loadLocalDirectory(currentPath);
-                  }
-                },
-              });
-            }}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-rose-500 hover:bg-rose-500/20 cursor-pointer"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            <span>Supprimer</span>
-          </button>
-        </div>
-      )}
+      <FileContextMenu
+        isDark={isDark}
+        contextMenu={contextMenu}
+        onClose={() => setContextMenu(null)}
+        activeTab={activeTab}
+        currentPath={currentPath}
+        files={files}
+        selectedLocalPaths={selectedLocalPaths}
+        setSelectedLocalPaths={setSelectedLocalPaths}
+        selectedRemotePaths={selectedRemotePaths}
+        setSelectedRemotePaths={setSelectedRemotePaths}
+        onNavigateLocal={loadLocalDirectory}
+        onNavigateRemote={loadRemoteDirectory}
+        onCheckAndEnqueueTransfer={checkAndEnqueueTransfer}
+        onPromptInputModal={setInputModal}
+        onPromptConfirmModal={setConfirmModal}
+        setEditorModal={setEditorModal}
+        setChmodModal={setChmodModal}
+        logMessage={logMessage}
+      />
 
       {/* Modale transfert inter-onglets */}
-      {crossTabModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-[440px] rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center gap-2 border-b border-neutral-500/20 pb-2 text-sky-500">
-              <Send className="h-5 w-5 shrink-0" />
-              <span className="font-semibold text-sm">Transfert vers une autre session</span>
-            </div>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Vous allez envoyer <span className="font-mono text-emerald-400 font-semibold">{crossTabModal.item.entry.name}</span> vers le serveur distant de l'onglet :<br />
-              <strong className="text-sky-400 font-semibold">{crossTabModal.targetTab.title}</strong> ({crossTabModal.targetTab.remotePath}).
-            </p>
+      <CrossTabModal
+        crossTabModal={crossTabModal}
+        onClose={() => setCrossTabModal(null)}
+        onConfirm={(item, targetTab, neverAskAgain) => {
+          if (neverAskAgain) {
+            setSkipCrossTabConfirm(true);
+            localStorage.setItem("gens_rft_skip_cross_confirm", "true");
+          }
+          enqueueCrossTabTransfer(item, targetTab);
+        }}
+        isDark={isDark}
+      />
 
-            <label className="flex items-center gap-2 cursor-pointer text-xs text-neutral-400 pt-1">
-              <input
-                type="checkbox"
-                checked={crossTabModal.neverAskAgain}
-                onChange={(e) =>
-                  setCrossTabModal({ ...crossTabModal, neverAskAgain: e.target.checked })
-                }
-                className="rounded cursor-pointer"
-              />
-              <span>Ne plus me demander pour cette session</span>
-            </label>
+      {/* Éditeur de texte distant */}
+      <FileEditorModal
+        editorModal={editorModal}
+        onClose={() => setEditorModal(null)}
+        activeTabId={activeTab.id}
+        onSuccess={() => loadRemoteDirectory(activeTab.remotePath)}
+        logMessage={logMessage}
+        isDark={isDark}
+      />
 
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setCrossTabModal(null)}
-                className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer"
-              >
-                Annuler
-              </button>
-              <button
-                onClick={() => {
-                  if (crossTabModal.neverAskAgain) {
-                    setSkipCrossTabConfirm(true);
-                    localStorage.setItem("gens_rft_skip_cross_confirm", "true");
-                  }
-                  checkAndEnqueueTransfer(
-                    crossTabModal.item.entry.name,
-                    crossTabModal.item.entry.path,
-                    crossTabModal.targetTab.remotePath,
-                    "upload",
-                    crossTabModal.item.entry.is_dir,
-                    crossTabModal.targetTab.id
-                  );
-                  setCrossTabModal(null);
-                }}
-                className="px-4 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-              >
-                Confirmer l'envoi
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Éditeur de texte */}
-      {editorModal && (
-        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`flex flex-col w-[920px] h-[600px] rounded-xl border shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            {/* Header éditeur */}
-            <div className="flex items-center justify-between border-b px-4 py-2 border-neutral-700/50">
-              <div className="flex items-center gap-2">
-                <FileEdit className="h-4 w-4 text-sky-400" />
-                <span className="font-semibold text-xs font-mono">{editorModal.filename}</span>
-                <span className="text-[11px] text-neutral-500">({editorModal.path})</span>
-                {editorModal.content !== editorModal.originalContent && (
-                  <span className="h-2 w-2 rounded-full bg-amber-400" title="Modifications non enregistrées" />
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setShowEditorSearch(!showEditorSearch)}
-                  className={`p-1.5 rounded text-xs flex items-center gap-1 border transition ${
-                    showEditorSearch
-                      ? "border-sky-500 bg-sky-500/20 text-sky-400"
-                      : "border-neutral-700 hover:bg-neutral-800 text-neutral-400"
-                  }`}
-                  title="Rechercher (Ctrl+F)"
-                >
-                  <Search className="h-3.5 w-3.5" />
-                  <span className="text-[10px]">Rechercher</span>
-                </button>
-                <button
-                  disabled={editorModal.saving}
-                  onClick={async () => {
-                    setEditorModal({ ...editorModal, saving: true });
-                    try {
-                      await invoke("save_remote_file_text", {
-                        sessionId: activeTab.id,
-                        remotePath: editorModal.path,
-                        content: editorModal.content,
-                      });
-                      logMessage(`Fichier sauvegardé avec succès : ${editorModal.filename}`);
-                      setEditorModal({ ...editorModal, originalContent: editorModal.content, saving: false });
-                    } catch (err) {
-                      logMessage(`Erreur de sauvegarde : ${err}`);
-                      setEditorModal({ ...editorModal, saving: false });
-                    }
-                  }}
-                  className="flex items-center gap-1.5 px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs cursor-pointer transition active:scale-95 disabled:opacity-50"
-                  title="Sauvegarder sur le serveur (Ctrl+S)"
-                >
-                  <Save className="h-3.5 w-3.5" />
-                  <span>{editorModal.saving ? "Sauvegarde..." : "Enregistrer"}</span>
-                </button>
-                <button
-                  onClick={() => {
-                    setEditorModal(null);
-                    setShowEditorSearch(false);
-                  }}
-                  className="p-1 rounded hover:bg-neutral-500/20 text-neutral-400 hover:text-white cursor-pointer transition"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Barre flottante de recherche */}
-            {showEditorSearch && (
-              <div className="flex items-center justify-between border-b px-3 py-1.5 bg-neutral-950/90 border-neutral-800 gap-2">
-                <div className="flex items-center gap-2 flex-1">
-                  <Search className="h-3.5 w-3.5 text-sky-400 shrink-0" />
-                  <input
-                    type="text"
-                    autoFocus
-                    placeholder="Rechercher dans le fichier..."
-                    value={editorSearchQuery}
-                    onChange={(e) => setEditorSearchQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        if (editorSearchMatches.length > 0) {
-                          const nextIdx = (currentMatchIndex + 1) % editorSearchMatches.length;
-                          setCurrentMatchIndex(nextIdx);
-                          const startPos = editorSearchMatches[nextIdx];
-                          if (editorTextareaRef.current) {
-                            editorTextareaRef.current.focus();
-                            editorTextareaRef.current.setSelectionRange(startPos, startPos + editorSearchQuery.length);
-                          }
-                        }
-                      } else if (e.key === "Escape") {
-                        setShowEditorSearch(false);
-                      }
-                    }}
-                    className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5 text-xs text-neutral-200 outline-none focus:border-sky-500 w-64 font-mono"
-                  />
-                  <span className="text-[11px] text-neutral-400">
-                    {editorSearchMatches.length > 0
-                      ? `${currentMatchIndex + 1} / ${editorSearchMatches.length}`
-                      : editorSearchQuery ? "0 résultat" : ""}
-                  </span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    disabled={editorSearchMatches.length === 0}
-                    onClick={() => {
-                      if (editorSearchMatches.length > 0) {
-                        const prevIdx = (currentMatchIndex - 1 + editorSearchMatches.length) % editorSearchMatches.length;
-                        setCurrentMatchIndex(prevIdx);
-                        const startPos = editorSearchMatches[prevIdx];
-                        if (editorTextareaRef.current) {
-                          editorTextareaRef.current.focus();
-                          editorTextareaRef.current.setSelectionRange(startPos, startPos + editorSearchQuery.length);
-                        }
-                      }
-                    }}
-                    className="p-1 rounded hover:bg-neutral-800 text-neutral-400 hover:text-white disabled:opacity-30 cursor-pointer"
-                    title="Occurrence précédente"
-                  >
-                    <ChevronLeft className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    disabled={editorSearchMatches.length === 0}
-                    onClick={() => {
-                      if (editorSearchMatches.length > 0) {
-                        const nextIdx = (currentMatchIndex + 1) % editorSearchMatches.length;
-                        setCurrentMatchIndex(nextIdx);
-                        const startPos = editorSearchMatches[nextIdx];
-                        if (editorTextareaRef.current) {
-                          editorTextareaRef.current.focus();
-                          editorTextareaRef.current.setSelectionRange(startPos, startPos + editorSearchQuery.length);
-                        }
-                      }
-                    }}
-                    className="p-1 rounded hover:bg-neutral-800 text-neutral-400 hover:text-white disabled:opacity-30 cursor-pointer"
-                    title="Occurrence suivante"
-                  >
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => setShowEditorSearch(false)}
-                    className="p-1 rounded hover:bg-neutral-800 text-neutral-500 hover:text-white cursor-pointer ml-1"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Zone code */}
-            <div className="flex-1 bg-neutral-950 flex overflow-hidden font-mono text-xs relative">
-              <div
-                ref={editorLineNumbersRef}
-                className="w-12 py-2 pr-2 text-right bg-neutral-900/60 text-neutral-600 border-r border-neutral-800/80 select-none overflow-hidden leading-relaxed font-mono text-[11px]"
-              >
-                {editorModal.content.split("\n").map((_, i) => (
-                  <div key={i} className="h-5">{i + 1}</div>
-                ))}
-              </div>
-
-              <textarea
-                ref={editorTextareaRef}
-                autoFocus
-                value={editorModal.content}
-                onChange={(e) => setEditorModal({ ...editorModal, content: e.target.value })}
-                onScroll={(e) => {
-                  if (editorLineNumbersRef.current) {
-                    editorLineNumbersRef.current.scrollTop = e.currentTarget.scrollTop;
-                  }
-                }}
-                onKeyDown={async (e) => {
-                  if (e.ctrlKey && e.key.toLowerCase() === "s") {
-                    e.preventDefault();
-                    setEditorModal((prev) => (prev ? { ...prev, saving: true } : null));
-                    try {
-                      await invoke("save_remote_file_text", {
-                        sessionId: activeTab.id,
-                        remotePath: editorModal.path,
-                        content: editorModal.content,
-                      });
-                      logMessage(`Fichier sauvegardé : ${editorModal.filename}`);
-                      setEditorModal((prev) => (prev ? { ...prev, originalContent: prev.content, saving: false } : null));
-                    } catch (err) {
-                      logMessage(`Erreur sauvegarde : ${err}`);
-                      setEditorModal((prev) => (prev ? { ...prev, saving: false } : null));
-                    }
-                  }
-                  if (e.ctrlKey && e.key.toLowerCase() === "f") {
-                    e.preventDefault();
-                    setShowEditorSearch(true);
-                  }
-                }}
-                className="flex-1 h-full resize-none bg-transparent text-neutral-200 outline-none p-2 leading-relaxed overflow-auto whitespace-pre font-mono selection:bg-sky-500/30"
-                placeholder="Contenu du fichier..."
-                spellCheck={false}
-              />
-            </div>
-
-            {/* Footer éditeur */}
-            <div className="flex items-center justify-between border-t border-neutral-800 px-4 py-1.5 text-[11px] text-neutral-500">
-              <div className="flex items-center gap-3">
-                <span>Lignes : {editorModal.content.split("\n").length}</span>
-                <span>Caractères : {editorModal.content.length}</span>
-              </div>
-              <div className="flex items-center gap-3 text-[10px]">
-                <span>Ctrl+F : Rechercher</span>
-                <span>Ctrl+S : Sauvegarder</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modale Gestionnaire de sites (composant refactorisé) */}
+      {/* Modale Gestionnaire de sites */}
       <SiteManagerModal
         isOpen={showSiteManager}
         onClose={() => setShowSiteManager(false)}
@@ -2555,443 +1423,107 @@ export default function App() {
         logMessage={logMessage}
       />
 
-      {/* Modale de bifurcation de connexion */}
-      {tabPromptModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-[450px] rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center gap-2 border-b border-neutral-500/20 pb-2 text-sky-500">
-              <Server className="h-5 w-5 shrink-0" />
-              <span className="font-semibold text-sm">Connexion déjà établie</span>
-            </div>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Une connexion est déjà active sur cet onglet (
-              <span className="text-sky-400 font-semibold">{activeTab.title}</span>).
-              Que souhaitez-vous faire ?
-            </p>
-            <div className="flex flex-col gap-2 pt-2">
-              <button
-                onClick={() => {
-                  const p = tabPromptModal.pendingParams;
-                  setTabPromptModal(null);
-                  handleDisconnect(activeTab.id);
-                  executeConnect(
-                    activeTab.id,
-                    p.protocol,
-                    p.host,
-                    p.port,
-                    p.username,
-                    p.authType,
-                    p.password,
-                    p.keyPath,
-                    p.passphrase,
-                    p.siteId,
-                    p.initialRemotePath,
-                    p.initialLocalPath
-                  );
-                }}
-                className="w-full py-2 rounded bg-amber-600 font-semibold text-xs text-white hover:bg-amber-500 cursor-pointer transition active:scale-95"
-              >
-                Couper la connexion actuelle et se connecter ici
-              </button>
-              <button
-                onClick={() => {
-                  const p = tabPromptModal.pendingParams;
-                  setTabPromptModal(null);
-                  const newId = createNewTab();
-                  executeConnect(
-                    newId,
-                    p.protocol,
-                    p.host,
-                    p.port,
-                    p.username,
-                    p.authType,
-                    p.password,
-                    p.keyPath,
-                    p.passphrase,
-                    p.siteId,
-                    p.initialRemotePath,
-                    p.initialLocalPath
-                  );
-                }}
-                className="w-full py-2 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-              >
-                Ouvrir la connexion dans un nouvel onglet
-              </button>
-              <button
-                onClick={() => setTabPromptModal(null)}
-                className="w-full py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-              >
-                Annuler
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Modale bifurcation de connexion */}
+      <TabPromptModal
+        tabPromptModal={tabPromptModal}
+        activeTab={activeTab}
+        onClose={() => setTabPromptModal(null)}
+        onReplaceConnection={() => {
+          if (!tabPromptModal) return;
+          const p = tabPromptModal.pendingParams;
+          handleDisconnect(activeTab.id);
+          executeConnect(
+            activeTab.id,
+            p.protocol,
+            p.host,
+            p.port,
+            p.username,
+            p.authType,
+            p.password,
+            p.keyPath,
+            p.passphrase,
+            p.siteId,
+            p.initialRemotePath,
+            p.initialLocalPath
+          );
+        }}
+        onOpenInNewTab={() => {
+          if (!tabPromptModal) return;
+          const p = tabPromptModal.pendingParams;
+          const newId = createNewTab();
+          executeConnect(
+            newId,
+            p.protocol,
+            p.host,
+            p.port,
+            p.username,
+            p.authType,
+            p.password,
+            p.keyPath,
+            p.passphrase,
+            p.siteId,
+            p.initialRemotePath,
+            p.initialLocalPath
+          );
+        }}
+        isDark={isDark}
+      />
 
       {/* Modale Paramètres */}
-      {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-[600px] h-[400px] flex flex-col rounded-xl border shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center justify-between border-b px-4 py-2.5 border-neutral-500/20">
-              <span className="font-semibold text-sm flex items-center gap-2 text-sky-500">
-                <Settings className="h-4 w-4" />
-                Paramètres de Gens-RFT
-              </span>
-              <button onClick={() => setShowSettings(false)} className="text-neutral-400 hover:text-white cursor-pointer transition">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex flex-1 overflow-hidden">
-              <div className={`w-44 border-r p-2 space-y-1 ${isDark ? "border-neutral-800 bg-neutral-950/40" : "border-neutral-200 bg-neutral-50"}`}>
-                <button
-                  onClick={() => setSettingsTab("general")}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded text-xs cursor-pointer transition ${
-                    settingsTab === "general" ? "bg-sky-600 text-white font-medium" : "hover:bg-neutral-500/10 text-neutral-400"
-                  }`}
-                >
-                  <Sliders className="h-3.5 w-3.5" />
-                  <span>Affichage & Thème</span>
-                </button>
-                <button
-                  onClick={() => setSettingsTab("panels")}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded text-xs cursor-pointer transition ${
-                    settingsTab === "panels" ? "bg-sky-600 text-white font-medium" : "hover:bg-neutral-500/10 text-neutral-400"
-                  }`}
-                >
-                  <Folder className="h-3.5 w-3.5" />
-                  <span>Panneaux & Outils</span>
-                </button>
-                <button
-                  onClick={() => setSettingsTab("about")}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded text-xs cursor-pointer transition ${
-                    settingsTab === "about" ? "bg-sky-600 text-white font-medium" : "hover:bg-neutral-500/10 text-neutral-400"
-                  }`}
-                >
-                  <Info className="h-3.5 w-3.5" />
-                  <span>À propos & Màj</span>
-                </button>
-              </div>
-
-              <div className="flex-1 p-5 overflow-y-auto text-xs space-y-4">
-                {settingsTab === "general" && (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="block font-semibold mb-1 text-neutral-300">Thème de l'interface</label>
-                      <select
-                        value={theme}
-                        onChange={(e) => setTheme(e.target.value as "dark" | "light")}
-                        className={`w-full rounded border px-3 py-1.5 focus:outline-none cursor-pointer transition ${
-                          isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
-                        }`}
-                      >
-                        <option value="dark">Mode Sombre</option>
-                        <option value="light">Mode Clair</option>
-                      </select>
-                    </div>
-
-                    <div className="border-t pt-3 border-neutral-500/20">
-                      <label className="block font-semibold mb-1 text-neutral-300">Fichiers système et cachés</label>
-                      <label className="flex items-center gap-2 cursor-pointer mt-2">
-                        <input
-                          type="checkbox"
-                          checked={showHidden}
-                          onChange={(e) => setShowHidden(e.target.checked)}
-                          className="rounded cursor-pointer"
-                        />
-                        <span>Afficher les fichiers et répertoires cachés (.dotfiles)</span>
-                      </label>
-                    </div>
-
-                    <div className="border-t pt-3 border-neutral-500/20">
-                      <label className="block font-semibold mb-1 text-neutral-300">Restauration des chemins</label>
-                      <div className="space-y-2 mt-2">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={rememberLocalPath}
-                            onChange={(e) => setRememberLocalPath(e.target.checked)}
-                            className="rounded cursor-pointer"
-                          />
-                          <span>Mémoriser le dernier dossier local au démarrage</span>
-                        </label>
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={rememberRemotePath}
-                            onChange={(e) => setRememberRemotePath(e.target.checked)}
-                            className="rounded cursor-pointer"
-                          />
-                          <span>Mémoriser le dernier dossier distant par serveur (SiteProfile)</span>
-                        </label>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {settingsTab === "panels" && (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="block font-semibold mb-1 text-neutral-300">Arborescence des dossiers</label>
-                      <label className="flex items-center gap-2 cursor-pointer mt-2">
-                        <input
-                          type="checkbox"
-                          checked={showTreePanels}
-                          onChange={(e) => setShowTreePanels(e.target.checked)}
-                          className="rounded cursor-pointer"
-                        />
-                        <span>Afficher les arborescences en arbre au-dessus des listes</span>
-                      </label>
-                    </div>
-
-                    <div className="border-t pt-3 border-neutral-500/20">
-                      <label className="block font-semibold mb-1 text-neutral-300">Terminal SSH interactif</label>
-                      <label className="flex items-center gap-2 cursor-pointer mt-2">
-                        <input
-                          type="checkbox"
-                          checked={enableSshTerminal}
-                          onChange={(e) => setEnableSshTerminal(e.target.checked)}
-                          className="rounded cursor-pointer"
-                        />
-                        <span>Activer et intégrer l'émulateur de terminal SSH</span>
-                      </label>
-                    </div>
-
-                    <div className="border-t pt-3 border-neutral-500/20">
-                      <label className="block font-semibold mb-1 text-neutral-300">Transferts concurrents</label>
-                      <input
-                        type="number"
-                        min="1"
-                        max="10"
-                        value={maxConcurrent}
-                        onChange={(e) => setMaxConcurrent(e.target.value)}
-                        className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
-                          isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
-                        }`}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {settingsTab === "about" && (
-                  <div className="space-y-4">
-                    <div>
-                      <h4 className="font-semibold text-neutral-200">Gens-RFT Desktop</h4>
-                      <p className="text-neutral-400 mt-1">Version : 1.0.0 (Release Build)</p>
-                      <p className="text-neutral-500 text-[11px] mt-1">Client SFTP / SSH haute performance basé sur Tauri v2 et Rust.</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="flex justify-end p-3 border-t border-neutral-500/20">
-              <button
-                onClick={() => setShowSettings(false)}
-                className="px-4 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-              >
-                Fermer
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <SettingsModal
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        theme={theme}
+        setTheme={setTheme}
+        showHidden={showHidden}
+        setShowHidden={setShowHidden}
+        rememberLocalPath={rememberLocalPath}
+        setRememberLocalPath={setRememberLocalPath}
+        rememberRemotePath={rememberRemotePath}
+        setRememberRemotePath={setRememberRemotePath}
+        showTreePanels={showTreePanels}
+        setShowTreePanels={setShowTreePanels}
+        enableSshTerminal={enableSshTerminal}
+        setEnableSshTerminal={setEnableSshTerminal}
+        maxConcurrent={maxConcurrent}
+        setMaxConcurrent={setMaxConcurrent}
+        isDark={isDark}
+      />
 
       {/* Modale Conflit */}
-      {conflictModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-96 rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center gap-2 border-b border-neutral-500/20 pb-2 text-amber-500">
-              <AlertTriangle className="h-5 w-5 shrink-0" />
-              <span className="font-semibold text-sm">Fichier déjà existant</span>
-            </div>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              Un élément nommé <span className="font-mono text-sky-500 font-semibold">{conflictModal.filename}</span> existe déjà dans la destination.
-            </p>
-            <div className="flex flex-col gap-2 pt-1">
-              <button
-                onClick={() => conflictModal.onResolve("overwrite")}
-                className="w-full py-1.5 rounded bg-rose-600 font-semibold text-xs text-white hover:bg-rose-500 cursor-pointer transition active:scale-95"
-              >
-                Écraser le fichier cible
-              </button>
-              <button
-                onClick={() => conflictModal.onResolve("rename")}
-                className="w-full py-1.5 rounded border border-neutral-700 font-semibold text-xs text-sky-500 hover:bg-neutral-500/10 cursor-pointer transition active:scale-95"
-              >
-                Renommer automatiquement
-              </button>
-              <button
-                onClick={() => conflictModal.onResolve("skip")}
-                className="w-full py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-              >
-                Ignorer ce fichier
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConflictModal
+        conflictModal={conflictModal}
+        onClose={() => {
+          setConflictQueue([]);
+          setConflictModal(null);
+          logMessage("Conflits ignorés / opération annulée.");
+        }}
+        isDark={isDark}
+      />
 
       {/* Modale Saisie */}
-      {inputModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-80 rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center justify-between border-b pb-2 border-neutral-500/20">
-              <span className="font-semibold text-sm">{inputModal.title}</span>
-              <button onClick={() => setInputModal(null)} className="text-neutral-400 hover:text-white cursor-pointer transition">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <div>
-              <label className="block text-xs text-neutral-400 mb-1">{inputModal.label}</label>
-              <input
-                type="text"
-                autoFocus
-                value={inputModal.value}
-                onChange={(e) => setInputModal({ ...inputModal, value: e.target.value })}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    inputModal.onConfirm(inputModal.value);
-                    setInputModal(null);
-                  }
-                }}
-                className={`w-full rounded border px-3 py-1.5 text-xs focus:outline-none transition ${
-                  isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
-                }`}
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setInputModal(null)}
-                className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-              >
-                Annuler
-              </button>
-              <button
-                onClick={() => {
-                  inputModal.onConfirm(inputModal.value);
-                  setInputModal(null);
-                }}
-                className="px-3 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-              >
-                Valider
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <InputModal
+        inputModal={inputModal}
+        onClose={() => setInputModal(null)}
+        isDark={isDark}
+      />
 
       {/* Modale Confirmation */}
-      {confirmModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-          <div
-            className={`w-80 rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center justify-between border-b pb-2 border-neutral-500/20">
-              <span className="font-semibold text-sm">{confirmModal.title}</span>
-              <button onClick={() => setConfirmModal(null)} className="text-neutral-400 hover:text-white cursor-pointer transition">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <p className="text-xs text-neutral-400 leading-relaxed">{confirmModal.message}</p>
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setConfirmModal(null)}
-                className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-              >
-                Annuler
-              </button>
-              <button
-                onClick={() => {
-                  confirmModal.onConfirm();
-                  setConfirmModal(null);
-                }}
-                className="px-3 py-1.5 rounded bg-rose-600 font-semibold text-xs text-white hover:bg-rose-500 cursor-pointer transition active:scale-95"
-              >
-                Confirmer
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmModal
+        confirmModal={confirmModal}
+        onClose={() => setConfirmModal(null)}
+        isDark={isDark}
+      />
 
       {/* Modale CHMOD */}
-      {chmodModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-6 animate-in fade-in duration-150">
-          <div
-            className={`w-80 rounded-xl border p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150 ${
-              isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
-            }`}
-          >
-            <div className="flex items-center justify-between border-b border-neutral-500/20 pb-3">
-              <span className="font-semibold text-sm flex items-center gap-2 text-sky-500">
-                <ShieldCheck className="h-4 w-4" /> Permissions (CHMOD)
-              </span>
-              <button onClick={() => setChmodModal(null)} className="text-neutral-400 hover:text-white cursor-pointer transition">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div>
-              <div className="text-xs text-neutral-400 mb-1 truncate">{chmodModal.name}</div>
-              <label className="block text-xs font-semibold text-neutral-300 mb-1">Valeur Octale</label>
-              <input
-                type="text"
-                maxLength={4}
-                value={chmodModal.octal}
-                onChange={(e) => setChmodModal({ ...chmodModal, octal: e.target.value })}
-                className={`w-full text-center font-mono text-lg rounded border py-1.5 text-sky-500 focus:outline-none transition ${
-                  isDark ? "bg-neutral-950 border-neutral-700" : "bg-neutral-50 border-neutral-300"
-                }`}
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                onClick={() => setChmodModal(null)}
-                className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-              >
-                Annuler
-              </button>
-              <button
-                onClick={async () => {
-                  const permVal = parseInt(chmodModal.octal, 8);
-                  try {
-                    await invoke("chmod_remote", { sessionId: activeTab.id, path: chmodModal.path, permissions: permVal });
-                    logMessage(`SITE CHMOD ${chmodModal.octal} ${chmodModal.name}`);
-                    setChmodModal(null);
-                    loadRemoteDirectory(activeTab.remotePath);
-                  } catch (err) {
-                    logMessage(`550 Échec CHMOD : ${err}`);
-                  }
-                }}
-                className="px-3 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
-              >
-                Appliquer
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ChmodModal
+        chmodModal={chmodModal}
+        onClose={() => setChmodModal(null)}
+        activeTabId={activeTab.id}
+        onSuccess={() => loadRemoteDirectory(activeTab.remotePath)}
+        logMessage={logMessage}
+        isDark={isDark}
+      />
     </div>
   );
 }
-

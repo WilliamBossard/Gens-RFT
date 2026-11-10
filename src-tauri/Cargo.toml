@@ -28,7 +28,7 @@ russh-sftp = "2.4"
 russh-keys = "0.45"
 async-trait = "0.1"
 walkdir = "2"
-suppaftp = { version = "6.0", default-features = false }
+suppaftp = { version = "6.0", default-features = false, features = ["native-tls"] }
 tauri-plugin-dialog = "2"
 
 

@@ -1,4 +1,4 @@
-﻿import { create } from "zustand";
+import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface QueueItem {
@@ -16,6 +16,9 @@ export interface QueueItem {
   lastBytes: number;
   lastTimestamp: number;
   sessionId: string;
+  relayToSessionId?: string;
+  relayDestDir?: string;
+  errorReason?: string;
 }
 
 interface TransferStore {
@@ -24,9 +27,10 @@ interface TransferStore {
   setMaxConcurrent: (limit: number) => void;
   addToQueue: (item: Omit<QueueItem, "id" | "status" | "percent" | "speed" | "eta" | "lastBytes" | "lastTimestamp">) => void;
   updateProgress: (transferId: string, transferred: number, total: number, percent: number) => void;
-  markStatus: (id: string, status: QueueItem["status"]) => void;
+  markStatus: (id: string, status: QueueItem["status"], errorReason?: string) => void;
   clearDone: () => void;
   cancelAll: () => Promise<void>;
+  cancelItem: (id: string) => Promise<void>;
   retryItem: (id: string) => void;
   retryAllFailed: () => void;
 }
@@ -53,6 +57,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
 
   updateProgress: (transferId, transferred, total, percent) => {
     const now = Date.now();
+    const safePercent = Math.min(100, Math.max(0, percent));
     set((state) => ({
       queue: state.queue.map((item) => {
         if (item.id !== transferId) return item;
@@ -60,7 +65,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
         let newSpeed = item.speed;
         let newEta = item.eta;
 
-        if (deltaSec >= 0.25) {
+        if (deltaSec >= 0.4) {
           const deltaBytes = Math.max(0, transferred - item.lastBytes);
           const bytesPerSec = deltaBytes / deltaSec;
 
@@ -68,7 +73,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
             newSpeed = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} Mo/s`;
           } else if (bytesPerSec > 1024) {
             newSpeed = `${(bytesPerSec / 1024).toFixed(0)} Ko/s`;
-          } else {
+          } else if (bytesPerSec > 0) {
             newSpeed = `${bytesPerSec.toFixed(0)} o/s`;
           }
 
@@ -76,27 +81,38 @@ export const useTransferStore = create<TransferStore>((set) => ({
           if (bytesPerSec > 0 && remainingBytes > 0) {
             const secondsLeft = Math.ceil(remainingBytes / bytesPerSec);
             newEta = secondsLeft < 60 ? `${secondsLeft}s` : `${Math.floor(secondsLeft / 60)}m ${secondsLeft % 60}s`;
-          } else if (percent >= 100) {
+          } else if (safePercent >= 100) {
             newEta = "0s";
           }
 
           return {
             ...item,
-            percent,
+            percent: safePercent,
             speed: newSpeed,
             eta: newEta,
             lastBytes: transferred,
             lastTimestamp: now,
           };
         }
-        return { ...item, percent };
+        return { ...item, percent: safePercent };
       }),
     }));
   },
 
-  markStatus: (id, status) => {
+  markStatus: (id, status, errorReason) => {
     set((state) => ({
-      queue: state.queue.map((it) => (it.id === id ? { ...it, status, percent: status === "done" ? 100 : it.percent } : it)),
+      queue: state.queue.map((it) =>
+        it.id === id
+          ? {
+              ...it,
+              status,
+              errorReason: status === "error" ? errorReason : undefined,
+              percent: status === "done" ? 100 : it.percent,
+              speed: status === "done" ? "Terminé" : status === "error" ? "Échec" : it.speed,
+              eta: status === "done" ? "0s" : status === "error" ? "--" : it.eta,
+            }
+          : it
+      ),
     }));
   },
 
@@ -107,10 +123,19 @@ export const useTransferStore = create<TransferStore>((set) => ({
   },
 
   cancelAll: async () => {
-    await invoke("cancel_current_transfer");
+    await invoke("cancel_current_transfer", { transferId: null });
     set((state) => ({
       queue: state.queue.map((it) =>
         it.status === "queued" || it.status === "running" ? { ...it, status: "error", speed: "Annulé" } : it
+      ),
+    }));
+  },
+
+  cancelItem: async (id: string) => {
+    await invoke("cancel_current_transfer", { transferId: id });
+    set((state) => ({
+      queue: state.queue.map((it) =>
+        it.id === id ? { ...it, status: "error", speed: "Annulé" } : it
       ),
     }));
   },
