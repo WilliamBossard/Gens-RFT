@@ -391,13 +391,15 @@ export default function RemotePane({
                       label: "Nom du dossier :",
                       value: "nouveau_dossier",
                       onConfirm: async (val) => {
+                        const dirName = val.trim();
+                        if (!dirName) return;
                         const sep = activeTab.remotePath.endsWith("/") ? "" : "/";
                         try {
                           await invoke("create_remote_dir", {
                             sessionId: activeTab.id,
-                            path: `${activeTab.remotePath}${sep}${val}`,
+                            path: `${activeTab.remotePath}${sep}${dirName}`,
                           });
-                          logMessage(`MKD ${activeTab.remotePath}${sep}${val}`);
+                          logMessage(`MKD ${activeTab.remotePath}${sep}${dirName}`);
                           onNavigateRemote(activeTab.remotePath);
                         } catch (err) {
                           logMessage(`550 Échec création dossier distant : ${err}`);

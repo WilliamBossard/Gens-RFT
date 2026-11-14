@@ -33,6 +33,7 @@ interface Props {
   setLocalPathInput: (val: string) => void;
   localSearch: string;
   setLocalSearch: (val: string) => void;
+  localHistory: string[];
   localHistoryIndex: number;
   localSort: { field: SortField; order: SortOrder };
   setLocalSort: React.Dispatch<React.SetStateAction<{ field: SortField; order: SortOrder }>>;
@@ -86,6 +87,7 @@ export default function LocalPane({
   setLocalPathInput,
   localSearch,
   setLocalSearch,
+  localHistory,
   localHistoryIndex,
   localSort,
   setLocalSort,
@@ -293,7 +295,7 @@ export default function LocalPane({
             </button>
             <button
               onClick={onLocalHistoryForward}
-              disabled={localHistoryIndex < 0}
+              disabled={localHistoryIndex < 0 || localHistoryIndex >= localHistory.length - 1}
               className="rounded p-1 hover:bg-neutral-500/20 cursor-pointer transition active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed"
               title="Dossier local suivant"
             >
@@ -323,8 +325,10 @@ export default function LocalPane({
                 label: "Nom du dossier :",
                 value: "nouveau_dossier",
                 onConfirm: async (val) => {
+                  const dirName = val.trim();
+                  if (!dirName) return;
                   const cleanPath = currentPath.replace(/[\\/]+$/, "");
-                  const target = `${cleanPath}\\${val}`;
+                  const target = `${cleanPath}\\${dirName}`;
                   try {
                     await invoke("create_local_dir", { path: target });
                     logMessage(`Dossier local créé : ${target}`);

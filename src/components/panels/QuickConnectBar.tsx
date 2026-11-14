@@ -1,4 +1,4 @@
-import React, { useRef } from "react";
+import React, { useRef, useEffect } from "react";
 import { SlidersHorizontal, Settings, Server, Unplug, ChevronDown } from "lucide-react";
 import { QuickHistoryItem, TabSession } from "../../types";
 
@@ -56,6 +56,19 @@ export default function QuickConnectBar({
 }: Props) {
   const quickHistoryRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    if (!showQuickHistoryDropdown) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (quickHistoryRef.current && !quickHistoryRef.current.contains(e.target as Node)) {
+        setShowQuickHistoryDropdown(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showQuickHistoryDropdown, setShowQuickHistoryDropdown]);
+
   const handleQuickConnect = () => {
     let host = quickHost.trim();
     let port = quickPort.trim();
@@ -79,10 +92,13 @@ export default function QuickConnectBar({
       protocol = "FTPS";
     }
 
-    if (host.includes(":")) {
-      const parts = host.split(":");
-      host = parts[0];
-      port = parts[1];
+    // Support [ipv6]:port ou host:port (en préservant les adresses IPv6 brutes)
+    const hostPortMatch = host.match(/^(?:\[([a-fA-F0-9:]+)\]|([^:]+)):(\d+)$/);
+    if (hostPortMatch) {
+      host = hostPortMatch[1] || hostPortMatch[2];
+      port = hostPortMatch[3];
+    } else if (host.startsWith("[") && host.endsWith("]")) {
+      host = host.slice(1, -1);
     }
 
     onConnectRequest(

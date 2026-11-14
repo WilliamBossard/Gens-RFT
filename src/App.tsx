@@ -57,10 +57,20 @@ export default function App() {
     localStorage.setItem("gens_rft_theme", theme);
   }, [theme]);
 
-  const [showHidden, setShowHidden] = useState(false);
-  const [showTreePanels, setShowTreePanels] = useState(true);
-  const [enableSshTerminal, setEnableSshTerminal] = useState(true);
-  const [maxConcurrent, setMaxConcurrent] = useState("2");
+  const [showHidden, setShowHidden] = useState<boolean>(() => {
+    return localStorage.getItem("gens_rft_show_hidden") === "true";
+  });
+  const [showTreePanels, setShowTreePanels] = useState<boolean>(() => {
+    const v = localStorage.getItem("gens_rft_show_tree_panels");
+    return v !== null ? JSON.parse(v) : true;
+  });
+  const [enableSshTerminal, setEnableSshTerminal] = useState<boolean>(() => {
+    const v = localStorage.getItem("gens_rft_enable_ssh_terminal");
+    return v !== null ? JSON.parse(v) : true;
+  });
+  const [maxConcurrent, setMaxConcurrent] = useState<string>(() => {
+    return localStorage.getItem("gens_rft_max_concurrent") || "2";
+  });
 
   const [rememberLocalPath, setRememberLocalPath] = useState<boolean>(() => {
     const v = localStorage.getItem("gens_rft_opt_remember_local");
@@ -453,18 +463,18 @@ export default function App() {
     setRemotePathInput(activeTab.remotePath);
   }, [activeTab.remotePath]);
 
-  // Sauvegarde sécurisée des profils
+  // Sauvegarde sécurisée des profils (avec debounce pour éviter de recalculer PBKDF2 à chaque clic)
   useEffect(() => {
     if (!isSitesLoaded) return;
-    const saveSecureSites = async () => {
+    const timer = setTimeout(async () => {
       try {
         const encrypted = await encryptVaultData(sites);
         localStorage.setItem("gens_rft_sites", encrypted);
       } catch {
         localStorage.setItem("gens_rft_sites", JSON.stringify(sites));
       }
-    };
-    saveSecureSites();
+    }, 800);
+    return () => clearTimeout(timer);
   }, [sites, isSitesLoaded]);
 
   useEffect(() => {
@@ -474,6 +484,22 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("gens_rft_opt_remember_remote", JSON.stringify(rememberRemotePath));
   }, [rememberRemotePath]);
+
+  useEffect(() => {
+    localStorage.setItem("gens_rft_show_hidden", JSON.stringify(showHidden));
+  }, [showHidden]);
+
+  useEffect(() => {
+    localStorage.setItem("gens_rft_show_tree_panels", JSON.stringify(showTreePanels));
+  }, [showTreePanels]);
+
+  useEffect(() => {
+    localStorage.setItem("gens_rft_enable_ssh_terminal", JSON.stringify(enableSshTerminal));
+  }, [enableSshTerminal]);
+
+  useEffect(() => {
+    localStorage.setItem("gens_rft_max_concurrent", maxConcurrent);
+  }, [maxConcurrent]);
 
   // Mémorisation du chemin local
   useEffect(() => {
@@ -623,7 +649,7 @@ export default function App() {
         } else {
           const finalDownloadName = nextItem.destFileName || nextItem.filename;
           logMessage(`RETR [${finalDownloadName}] -> ${nextItem.destDir}`);
-          await invoke("download_item", {
+          const savedLocalName = await invoke<string>("download_item", {
             sessionId: nextItem.sessionId,
             transferId: nextItem.id,
             remotePath: nextItem.sourcePath,
@@ -634,7 +660,8 @@ export default function App() {
 
           if (nextItem.relayToSessionId && nextItem.relayDestDir) {
             const finalRelayName = nextItem.destFileName || nextItem.filename;
-            const localRelayFile = `${nextItem.destDir.replace(/[\\/]+$/, "")}\\${finalRelayName}`;
+            const effectiveLocalName = savedLocalName || finalRelayName;
+            const localRelayFile = `${nextItem.destDir.replace(/[\\/]+$/, "")}\\${effectiveLocalName}`;
             logMessage(`Relais inter-serveurs : Envoi vers le serveur cible (${finalRelayName})...`);
             updateProgress(nextItem.id, 0, 100, 0);
             await invoke("upload_item", {
@@ -1052,10 +1079,25 @@ export default function App() {
     isDir: boolean,
     destSessionId?: string
   ) => {
-    const targetFileList = direction === "upload" ? activeTab.remoteFiles : files;
-    const exists = direction === "download"
-      ? targetFileList.some((f) => f.name.toLowerCase() === filename.toLowerCase())
-      : targetFileList.some((f) => f.name.toLowerCase() === filename.toLowerCase());
+    const targetSessionId = destSessionId || activeTab.id;
+    const isTargetCurrentDir =
+      direction === "upload"
+        ? targetSessionId === activeTab.id &&
+          destDir.replace(/\/+$/, "") === activeTab.remotePath.replace(/\/+$/, "")
+        : destDir.replace(/[\\/]+$/, "").toLowerCase() === currentPath.replace(/[\\/]+$/, "").toLowerCase();
+
+    let exists = false;
+    if (isTargetCurrentDir) {
+      if (direction === "upload") {
+        exists = activeTab.remoteFiles.some((f) =>
+          activeTab.protocol === "SFTP"
+            ? f.name === filename
+            : f.name.toLowerCase() === filename.toLowerCase()
+        );
+      } else {
+        exists = files.some((f) => f.name.toLowerCase() === filename.toLowerCase());
+      }
+    }
 
     if (exists) {
       setConflictQueue((prev) => [
@@ -1066,12 +1108,12 @@ export default function App() {
           destDir,
           direction,
           isDir,
-          destSessionId: destSessionId || activeTab.id,
+          destSessionId: targetSessionId,
         },
       ]);
     } else {
       addToQueue({
-        sessionId: destSessionId || activeTab.id,
+        sessionId: targetSessionId,
         filename,
         sourcePath,
         destDir,
@@ -1262,6 +1304,7 @@ export default function App() {
           setLocalPathInput={setLocalPathInput}
           localSearch={localSearch}
           setLocalSearch={setLocalSearch}
+          localHistory={localHistory}
           localHistoryIndex={localHistoryIndex}
           localSort={localSort}
           setLocalSort={setLocalSort}

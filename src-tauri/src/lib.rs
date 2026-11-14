@@ -46,6 +46,7 @@ pub enum PtyCommand {
     Resize { cols: u32, rows: u32 },
 }
 
+#[derive(Clone)]
 pub struct ClientHandler {
     pub host: String,
     pub port: u16,
@@ -80,7 +81,7 @@ impl client::Handler for ClientHandler {
 }
 
 pub struct ServerSession {
-    pub ssh_session: Option<client::Handle<ClientHandler>>,
+    pub ssh_session: Option<Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>>,
     pub pty_sender: Option<mpsc::Sender<PtyCommand>>,
     pub sftp: Option<Arc<SftpSession>>,
     pub ftp: Option<Arc<tokio::sync::Mutex<NativeTlsFtpStream>>>,
@@ -327,7 +328,7 @@ async fn connect_server(
     sessions.insert(
         session_id,
         ServerSession {
-            ssh_session: Some(session),
+            ssh_session: Some(Arc::new(tokio::sync::Mutex::new(session))),
             pty_sender: None,
             sftp: Some(Arc::new(sftp)),
             ftp: None,
@@ -347,12 +348,17 @@ async fn disconnect_server(session_id: String, state: State<'_, AppState>) -> Re
             let mut ftp = ftp_arc.lock().await;
             let _ = ftp.quit();
         }
-        if let Some(ssh) = sess.ssh_session.take() {
+        if let Some(ssh_arc) = sess.ssh_session.take() {
+            let ssh = ssh_arc.lock().await;
             let _ = ssh
                 .disconnect(russh::Disconnect::ByApplication, "", "en")
                 .await;
         }
     }
+
+    let temp_preview = std::env::temp_dir().join("Gens-RFT").join("preview").join(&session_id);
+    let _ = tokio::fs::remove_dir_all(temp_preview).await;
+
     Ok(())
 }
 
@@ -377,16 +383,18 @@ async fn start_ssh_pty(
     rows: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    let sess = sessions
-        .get_mut(&session_id)
-        .ok_or_else(|| "Session SSH inactive".to_string())?;
+    let ssh_arc = {
+        let sessions = state.sessions.lock().await;
+        let sess = sessions
+            .get(&session_id)
+            .ok_or_else(|| "Session SSH inactive".to_string())?;
 
-    let session = sess
-        .ssh_session
-        .as_mut()
-        .ok_or_else(|| "Session SSH inactive".to_string())?;
+        sess.ssh_session
+            .clone()
+            .ok_or_else(|| "Session SSH inactive".to_string())?
+    };
 
+    let session = ssh_arc.lock().await;
     let mut channel = session
         .channel_open_session()
         .await
@@ -401,12 +409,15 @@ async fn start_ssh_pty(
         .request_shell(true)
         .await
         .map_err(|e| format!("Échec lancement shell: {}", e))?;
-
-    // Réinitialise l'émetteur précédent pour clore toute tâche fantôme
-    sess.pty_sender = None;
+    drop(session);
 
     let (tx, mut rx) = mpsc::channel::<PtyCommand>(128);
-    sess.pty_sender = Some(tx);
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(sess) = sessions.get_mut(&session_id) {
+            sess.pty_sender = Some(tx);
+        }
+    }
 
     let event_name = format!("ssh_pty_output_{}", session_id);
     tokio::spawn(async move {
@@ -1109,6 +1120,9 @@ async fn upload_item_inner(
         let mut total_folder_bytes: u64 = 0;
 
         for entry in WalkDir::new(local_path).into_iter().filter_map(|e| e.ok()) {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err("Transfert annulé par l'utilisateur".to_string());
+            }
             let rel = match entry.path().strip_prefix(local_path) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -1413,10 +1427,16 @@ async fn download_item_inner(
             let root_local_dir = base_dest.join(&safe_filename);
             fs::create_dir_all(&root_local_dir).map_err(|e| e.to_string())?;
 
-            let mut queue = vec![(remote_path.to_string(), root_local_dir)];
-            while let Some((rem_dir, loc_dir)) = queue.pop() {
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(remote_path.to_string());
+            let mut queue = vec![(remote_path.to_string(), root_local_dir, 0usize)];
+            while let Some((rem_dir, loc_dir, depth)) = queue.pop() {
                 if cancel_flag.load(Ordering::Relaxed) {
                     return Err("Transfert annulé".to_string());
+                }
+
+                if depth > 40 {
+                    continue;
                 }
 
                 let lines = {
@@ -1428,8 +1448,10 @@ async fn download_item_inner(
                     if let Some(item) = parse_ftp_entry(&line, &rem_dir) {
                         let sub_loc = loc_dir.join(sanitize_windows_filename(&item.name));
                         if item.is_dir {
-                            let _ = fs::create_dir_all(&sub_loc);
-                            queue.push((item.path, sub_loc));
+                            if visited.insert(item.path.clone()) {
+                                let _ = fs::create_dir_all(&sub_loc);
+                                queue.push((item.path, sub_loc, depth + 1));
+                            }
                         } else {
                             let file = fs::File::create(&sub_loc).map_err(|e| e.to_string())?;
                             let mut progress_writer = ProgressWrite {
@@ -1468,7 +1490,7 @@ async fn download_item_inner(
                 }
             }
         } else {
-            let local_target = base_dest.join(safe_filename);
+            let local_target = base_dest.join(&safe_filename);
             let file = fs::File::create(&local_target).map_err(|e| e.to_string())?;
 
             let total_size = {
@@ -1517,7 +1539,7 @@ async fn download_item_inner(
             }
         }
 
-        return Ok("Téléchargement FTP terminé".into());
+        return Ok(safe_filename);
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
@@ -1531,10 +1553,16 @@ async fn download_item_inner(
         let mut files_to_download: Vec<(String, PathBuf, u64)> = Vec::new();
         let mut total_folder_bytes: u64 = 0;
 
-        let mut queue = vec![(remote_path.to_string(), root_local_dir)];
-        while let Some((rem_dir, loc_dir)) = queue.pop() {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(remote_path.to_string());
+        let mut queue = vec![(remote_path.to_string(), root_local_dir, 0usize)];
+        while let Some((rem_dir, loc_dir, depth)) = queue.pop() {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err("Transfert annulé".to_string());
+            }
+
+            if depth > 40 {
+                continue;
             }
 
             if let Ok(mut dir) = sftp.read_dir(&rem_dir).await {
@@ -1550,15 +1578,17 @@ async fn download_item_inner(
                     let mut is_sub_dir = item.file_type().is_dir();
                     if item.file_type().is_symlink() {
                         if let Ok(target_meta) = sftp.metadata(&sub_rem).await {
-                            if target_meta.is_dir() {
+                            if target_meta.is_dir() && !visited.contains(&sub_rem) {
                                 is_sub_dir = true;
                             }
                         }
                     }
 
                     if is_sub_dir {
-                        let _ = tokio::fs::create_dir_all(&sub_loc).await;
-                        queue.push((sub_rem, sub_loc));
+                        if visited.insert(sub_rem.clone()) {
+                            let _ = tokio::fs::create_dir_all(&sub_loc).await;
+                            queue.push((sub_rem, sub_loc, depth + 1));
+                        }
                     } else {
                         let size = item.metadata().size.unwrap_or(0);
                         total_folder_bytes += size;
@@ -1601,7 +1631,7 @@ async fn download_item_inner(
             ));
         }
     } else {
-        let local_target = base_dest.join(safe_filename);
+        let local_target = base_dest.join(&safe_filename);
         download_single_file_sftp(
             app,
             &sftp,
@@ -1614,7 +1644,7 @@ async fn download_item_inner(
         .await?;
     }
 
-    Ok("Téléchargement terminé".into())
+    Ok(safe_filename)
 }
 
 #[tauri::command]
@@ -1818,19 +1848,24 @@ async fn exec_remote_command(
     command: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let mut sessions = state.sessions.lock().await;
-    let sess = sessions
-        .get_mut(&session_id)
-        .ok_or_else(|| "Session inactive".to_string())?;
+    let ssh_arc = {
+        let sessions = state.sessions.lock().await;
+        let sess = sessions
+            .get(&session_id)
+            .ok_or_else(|| "Session inactive".to_string())?;
 
-    let session = sess.ssh_session.as_mut().ok_or_else(|| {
-        "Session SSH inactive (FTP ne supporte pas l'exécution shell)".to_string()
-    })?;
+        sess.ssh_session.clone().ok_or_else(|| {
+            "Session SSH inactive (FTP ne supporte pas l'exécution shell)".to_string()
+        })?
+    };
 
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Impossible d'ouvrir un canal SSH : {}", e))?;
+    let mut channel = {
+        let session = ssh_arc.lock().await;
+        session
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Impossible d'ouvrir un canal SSH : {}", e))?
+    };
 
     channel
         .exec(true, command.as_bytes())

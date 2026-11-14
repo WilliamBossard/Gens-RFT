@@ -97,7 +97,7 @@ export default function DirectoryTree({
       for (const p of hierarchy) {
         const key = getKey(p);
         if (key === currKey && subFolders.length > 0) continue;
-        if (childrenCache[key] && childrenCache[key].length > 0) continue;
+        if (childrenCache[key] !== undefined) continue;
 
         try {
           if (isRemote) {
@@ -134,7 +134,7 @@ export default function DirectoryTree({
 
     setExpandedNodes((prev) => ({ ...prev, [key]: isNowExpanded }));
 
-    if (isNowExpanded && (!childrenCache[key] || childrenCache[key].length === 0)) {
+    if (isNowExpanded && childrenCache[key] === undefined) {
       setLoadingNodes((prev) => ({ ...prev, [key]: true }));
       try {
         if (isRemote) {

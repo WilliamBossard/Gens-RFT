@@ -81,12 +81,12 @@ export default function FileContextMenu({
   return (
     <div
       style={{
-        top: `${Math.min(window.innerHeight - 280, contextMenu.y)}px`,
-        left: `${Math.min(window.innerWidth - 220, contextMenu.x)}px`,
+        top: `${Math.max(10, Math.min(window.innerHeight - 440, contextMenu.y))}px`,
+        left: `${Math.max(10, Math.min(window.innerWidth - 240, contextMenu.x))}px`,
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
-      className={`fixed z-[100] min-w-56 rounded-lg border py-1 shadow-2xl text-xs backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 ${
+      className={`fixed z-[100] min-w-56 max-h-[calc(100vh-20px)] overflow-y-auto rounded-lg border py-1 shadow-2xl text-xs backdrop-blur-md animate-in fade-in zoom-in-95 duration-100 ${
         isDark ? "border-neutral-800 bg-neutral-900/95 text-neutral-200" : "border-neutral-300 bg-white/95 text-neutral-800"
       }`}
     >
@@ -242,15 +242,28 @@ export default function FileContextMenu({
                 onClick={async () => {
                   const entry = contextMenu.entry!;
                   onClose();
-                  logMessage(`Téléchargement temporaire et ouverture de "${entry.name}"...`);
-                  try {
-                    const tempPath = await invoke<string>("open_remote_with_system", {
-                      sessionId: activeTab.id,
-                      remotePath: entry.path,
+                  const isExec = /\.(exe|bat|cmd|ps1|vbs|msi|scr|com|reg|sh)$/i.test(entry.name);
+                  const performOpen = async () => {
+                    logMessage(`Téléchargement temporaire et ouverture de "${entry.name}"...`);
+                    try {
+                      const tempPath = await invoke<string>("open_remote_with_system", {
+                        sessionId: activeTab.id,
+                        remotePath: entry.path,
+                      });
+                      logMessage(`Fichier ouvert : ${tempPath}`);
+                    } catch (err) {
+                      logMessage(`Erreur d'ouverture : ${err}`);
+                    }
+                  };
+
+                  if (isExec) {
+                    onPromptConfirmModal({
+                      title: "Avertissement de sécurité",
+                      message: `"${entry.name}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec Windows ?`,
+                      onConfirm: performOpen,
                     });
-                    logMessage(`Fichier ouvert : ${tempPath}`);
-                  } catch (err) {
-                    logMessage(`Erreur d'ouverture : ${err}`);
+                  } else {
+                    await performOpen();
                   }
                 }}
                 className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
