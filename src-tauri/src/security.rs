@@ -12,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::models::HostKeyRejectReason;
 
+#[cfg(any(windows, test))]
 pub fn zeroize_bytes(buf: &mut [u8]) {
     buf.zeroize();
 }

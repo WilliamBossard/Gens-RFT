@@ -157,10 +157,11 @@ pub fn rename_local(old_path: String, new_path: String) -> Result<(), String> {
 
 fn make_writable(path: &Path) {
     if let Ok(metadata) = fs::metadata(path) {
-        let mut perms = metadata.permissions();
+        let perms = metadata.permissions();
         if perms.readonly() {
             #[cfg(windows)]
             {
+                let mut perms = perms;
                 #[allow(clippy::permissions_set_readonly_false)]
                 perms.set_readonly(false);
                 let _ = fs::set_permissions(path, perms);
