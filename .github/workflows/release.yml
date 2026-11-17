@@ -12,12 +12,12 @@ env:
 jobs:
   meta:
     name: Read version from Cargo.toml
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.read_version.outputs.version }}
       tag: ${{ steps.read_version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract Cargo.toml version
         id: read_version
@@ -47,7 +47,7 @@ jobs:
             args: --target universal-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -55,9 +55,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -75,7 +75,7 @@ jobs:
         run: npx tauri build ${{ matrix.args }}
 
       - name: Upload bundle artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bundle-${{ matrix.platform }}
           path: |
@@ -90,10 +90,10 @@ jobs:
   draft-release:
     name: Create Draft Release
     needs: [meta, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-artifacts
           merge-multiple: true
@@ -102,7 +102,7 @@ jobs:
         run: ls -la release-artifacts
 
       - name: Create GitHub Draft Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: Gens-RFT ${{ needs.meta.outputs.tag }}
