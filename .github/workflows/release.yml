@@ -99,10 +99,23 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
-      - name: Flatten release assets
+      - name: Rename and flatten release assets
         run: |
           mkdir -p release-files
-          find release-artifacts -type f -exec cp -v {} release-files/ \;
+          V="${{ needs.meta.outputs.version }}"
+          while IFS= read -r f; do
+            base=$(basename "$f")
+            case "$base" in
+              *-setup.exe) cp -v "$f" "release-files/Gens-RFT_v${V}_windows-x64_installer.exe" ;;
+              *.exe)       cp -v "$f" "release-files/Gens-RFT_v${V}_windows-x64_portable.exe" ;;
+              *.msi)       cp -v "$f" "release-files/Gens-RFT_v${V}_windows-x64_installer.msi" ;;
+              *.AppImage)  cp -v "$f" "release-files/Gens-RFT_v${V}_linux-x64_portable.AppImage" ;;
+              *.deb)       cp -v "$f" "release-files/Gens-RFT_v${V}_linux-x64_installer.deb" ;;
+              *.rpm)       cp -v "$f" "release-files/Gens-RFT_v${V}_linux-x64_installer.rpm" ;;
+              *.dmg)       cp -v "$f" "release-files/Gens-RFT_v${V}_macos-universal_installer.dmg" ;;
+              *)           cp -v "$f" "release-files/$base" ;;
+            esac
+          done < <(find release-artifacts -type f)
           ls -lh release-files/
           if [ -z "$(ls -A release-files)" ]; then
             echo "No release files found!"
