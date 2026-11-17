@@ -1939,10 +1939,15 @@ mod tests {
     #[test]
     fn test_safe_local_delete_and_tar_verbose_and_ipv6() {
         assert!(!security::is_safe_local_delete_target(Path::new("C:")));
-        assert!(!security::is_safe_local_delete_target(Path::new("C:\\")));
-        assert!(!security::is_safe_local_delete_target(Path::new("C:\\Users\\..")));
         assert!(!security::is_safe_local_delete_target(Path::new("/")));
-        assert!(security::is_safe_local_delete_target(Path::new("C:\\Users\\test\\file.txt")));
+        assert!(!security::is_safe_local_delete_target(Path::new("/Users/..")));
+        assert!(security::is_safe_local_delete_target(Path::new("/Users/test/file.txt")));
+        #[cfg(windows)]
+        {
+            assert!(!security::is_safe_local_delete_target(Path::new("C:\\")));
+            assert!(!security::is_safe_local_delete_target(Path::new("C:\\Users\\..")));
+            assert!(security::is_safe_local_delete_target(Path::new("C:\\Users\\test\\file.txt")));
+        }
 
         assert!(local::is_safe_tar_verbose_line("-rw-r--r-- 0 user group 100 Jan 1 00:00 normal.txt"));
         assert!(local::is_safe_tar_verbose_line("drwxr-xr-x 0 user group 0 Jan 1 00:00 subdir"));
@@ -1973,8 +1978,13 @@ mod tests {
         assert!(!security::is_dangerous_executable_filename("readme.txt"));
 
         assert!(!local::is_safe_archive_entry("readme.txt:evil.exe"));
-        assert!(!security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\..\\Windows")));
-        assert!(security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\test\\docs")));
+        assert!(!security::is_safe_local_path_no_traversal(Path::new("/Users/../etc")));
+        assert!(security::is_safe_local_path_no_traversal(Path::new("/Users/test/docs")));
+        #[cfg(windows)]
+        {
+            assert!(!security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\..\\Windows")));
+            assert!(security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\test\\docs")));
+        }
 
         assert_eq!(
             extract_unzip_l_entry_name("1234  2026-01-01 12:00   dir/my file.txt"),
