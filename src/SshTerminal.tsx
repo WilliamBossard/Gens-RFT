@@ -1,9 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { RotateCcw } from "lucide-react";
 
 interface Props {
   sessionId: string;
@@ -17,19 +18,46 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const ptyStarted = useRef(false);
+  const [ptyClosed, setPtyClosed] = useState(false);
+
+  const launchPty = useCallback(() => {
+    const term = xtermInstance.current;
+    const fitAddon = fitAddonRef.current;
+    if (!term || !fitAddon || !isConnected || protocol === "FTP" || protocol === "FTPS") return;
+    ptyStarted.current = true;
+    setPtyClosed(false);
+    term.reset();
+    fitAddon.fit();
+    term.writeln("\x1b[32m[✓] Connexion au canal PTY interactif...\x1b[0m\r\n");
+
+    invoke("start_ssh_pty", {
+      sessionId,
+      cols: term.cols || 80,
+      rows: term.rows || 24,
+    }).catch((err) => {
+      term.writeln(`\r\n\x1b[31m[Erreur lancement PTY] : ${err}\x1b[0m`);
+      ptyStarted.current = false;
+      setPtyClosed(true);
+    });
+  }, [isConnected, protocol, sessionId]);
 
   useEffect(() => {
-    if (isVisible && fitAddonRef.current) {
-      setTimeout(() => {
+    if (isVisible && fitAddonRef.current && terminalRef.current) {
+      const el = terminalRef.current;
+      const timer = setTimeout(() => {
         try {
-          fitAddonRef.current?.fit();
+          if (el.clientWidth > 0 && el.clientHeight > 0) {
+            fitAddonRef.current?.fit();
+          }
         } catch {}
       }, 50);
+      return () => clearTimeout(timer);
     }
   }, [isVisible]);
 
   useEffect(() => {
-    if (!terminalRef.current) return;
+    const el = terminalRef.current;
+    if (!el) return;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -45,8 +73,10 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    term.open(terminalRef.current);
-    fitAddon.fit();
+    term.open(el);
+    if (el.clientWidth > 0 && el.clientHeight > 0) {
+      fitAddon.fit();
+    }
 
     xtermInstance.current = term;
     fitAddonRef.current = fitAddon;
@@ -56,23 +86,53 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
     });
 
     term.onResize(({ cols, rows }) => {
-      invoke("resize_ssh_pty", { sessionId, cols, rows }).catch(() => {});
+      if (cols > 1 && rows > 1) {
+        invoke("resize_ssh_pty", { sessionId, cols, rows }).catch(() => {});
+      }
     });
 
-    const unlistenPromise = listen<string>(`ssh_pty_output_${sessionId}`, (event) => {
-      term.write(event.payload);
-    });
+    let disposed = false;
+    let unlistenOutput: (() => void) | undefined;
+    let unlistenClosed: (() => void) | undefined;
+
+    listen<string>(`ssh_pty_output_${sessionId}`, (event) => {
+      if (!disposed) {
+        term.write(event.payload);
+      }
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlistenOutput = fn;
+      })
+      .catch(() => {});
+
+    listen<string>(`ssh_pty_closed_${sessionId}`, () => {
+      if (!disposed) {
+        ptyStarted.current = false;
+        setPtyClosed(true);
+        term.writeln("\r\n\x1b[33m[!] Canal shell SSH fermé par le serveur.\x1b[0m");
+      }
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlistenClosed = fn;
+      })
+      .catch(() => {});
 
     const resizeObserver = new ResizeObserver(() => {
       try {
-        fitAddon.fit();
+        if (el.clientWidth > 0 && el.clientHeight > 0) {
+          fitAddon.fit();
+        }
       } catch {}
     });
-    resizeObserver.observe(terminalRef.current);
+    resizeObserver.observe(el);
 
     return () => {
+      disposed = true;
       resizeObserver.disconnect();
-      unlistenPromise.then((unlisten) => unlisten());
+      unlistenOutput?.();
+      unlistenClosed?.();
       term.dispose();
       xtermInstance.current = null;
       fitAddonRef.current = null;
@@ -94,29 +154,28 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
       }
 
       if (!ptyStarted.current) {
-        ptyStarted.current = true;
-        term.reset();
-        fitAddon.fit();
-        term.writeln("\x1b[32m[✓] Connexion au canal PTY interactif...\x1b[0m\r\n");
-
-        invoke("start_ssh_pty", {
-          sessionId,
-          cols: term.cols || 80,
-          rows: term.rows || 24,
-        }).catch((err) => {
-          term.writeln(`\r\n\x1b[31m[Erreur lancement PTY] : ${err}\x1b[0m`);
-          ptyStarted.current = false;
-        });
+        launchPty();
       }
     } else {
       ptyStarted.current = false;
+      setPtyClosed(false);
       term.reset();
       term.writeln("\x1b[33m[!] En attente de connexion SFTP/SSH pour ouvrir le shell distant...\x1b[0m");
     }
-  }, [isConnected, sessionId, protocol]);
+  }, [isConnected, sessionId, protocol, launchPty]);
 
   return (
-    <div className="h-full w-full bg-neutral-950 p-2 overflow-hidden">
+    <div className="h-full w-full bg-neutral-950 p-2 overflow-hidden relative">
+      {ptyClosed && isConnected && protocol === "SFTP" && (
+        <button
+          onClick={launchPty}
+          className="absolute top-3 right-4 z-10 flex items-center gap-1.5 px-2.5 py-1 rounded bg-sky-600/90 hover:bg-sky-500 text-white text-[11px] font-semibold shadow cursor-pointer transition active:scale-95"
+          title="Rouvrir un canal terminal SSH"
+        >
+          <RotateCcw className="h-3 w-3" />
+          <span>Relancer le shell</span>
+        </button>
+      )}
       <div ref={terminalRef} className="h-full w-full" />
     </div>
   );

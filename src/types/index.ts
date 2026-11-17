@@ -47,11 +47,14 @@ export interface PendingConflict {
   direction: "upload" | "download";
   isDir: boolean;
   destSessionId: string;
+  relayToSessionId?: string;
+  relayDestDir?: string;
 }
 
 export interface ConfirmModalState {
   title: string;
   message: string;
+  infoOnly?: boolean;
   onConfirm: () => void;
 }
 
@@ -81,6 +84,7 @@ export interface TabPromptModalState {
     siteId?: string;
     initialRemotePath?: string;
     initialLocalPath?: string;
+    acceptInvalidCerts?: boolean;
   };
 }
 

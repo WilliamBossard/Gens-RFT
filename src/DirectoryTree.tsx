@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import { Folder, ChevronRight, ChevronDown, HelpCircle } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -11,8 +11,35 @@ interface Props {
   isDark?: boolean;
 }
 
+const MAX_CACHE_ENTRIES = 200;
+
+function arraysEqual(a: string[] | undefined, b: string[]): boolean {
+  if (!a || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function detectLocalRoot(path: string): string {
+  const normalized = path.replace(/\//g, "\\");
+  if (normalized.startsWith("\\\\")) {
+    const parts = normalized.slice(2).split("\\").filter(Boolean);
+    if (parts.length >= 2) {
+      return `\\\\${parts[0]}\\${parts[1]}\\`;
+    }
+  }
+  if (/^[a-zA-Z]:/.test(normalized)) {
+    return `${normalized.slice(0, 2)}\\`;
+  }
+  if (path.startsWith("/")) {
+    return "/";
+  }
+  return "C:\\";
+}
+
 function getPathHierarchy(path: string, isRemote: boolean, rootPath: string): string[] {
-  if (isRemote) {
+  if (isRemote || rootPath === "/") {
     const clean = path.replace(/\/+$/, "");
     if (!clean || clean === "/") return ["/"];
     const segments = clean.split("/").filter(Boolean);
@@ -24,7 +51,6 @@ function getPathHierarchy(path: string, isRemote: boolean, rootPath: string): st
     }
     return result;
   } else {
-    // Normalise les slashes pour Windows afin de supporter C:/ comme C:\
     const normalized = path.replace(/\//g, "\\");
     const clean = normalized.replace(/\\+$/, "");
     const root = rootPath.replace(/\\+$/, "");
@@ -44,7 +70,32 @@ function getPathHierarchy(path: string, isRemote: boolean, rootPath: string): st
   }
 }
 
-export default function DirectoryTree({
+function trimCache(
+  cache: Record<string, string[]>,
+  accessOrder: string[],
+  preserveKey?: string
+): Record<string, string[]> {
+  const keys = Object.keys(cache);
+  if (keys.length <= MAX_CACHE_ENTRIES) return cache;
+  const keep = new Set<string>();
+  if (preserveKey && cache[preserveKey] !== undefined) {
+    keep.add(preserveKey);
+  }
+  for (let i = accessOrder.length - 1; i >= 0 && keep.size < MAX_CACHE_ENTRIES; i--) {
+    const k = accessOrder[i];
+    if (cache[k] !== undefined) keep.add(k);
+  }
+  for (let i = keys.length - 1; i >= 0 && keep.size < MAX_CACHE_ENTRIES; i--) {
+    keep.add(keys[i]);
+  }
+  const trimmed: Record<string, string[]> = {};
+  for (const k of keep) {
+    trimmed[k] = cache[k];
+  }
+  return trimmed;
+}
+
+function DirectoryTreeComponent({
   sessionId,
   isRemote,
   currentPath,
@@ -55,67 +106,130 @@ export default function DirectoryTree({
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
   const [childrenCache, setChildrenCache] = useState<Record<string, string[]>>({});
   const [loadingNodes, setLoadingNodes] = useState<Record<string, boolean>>({});
+  const childrenCacheRef = useRef(childrenCache);
+  useEffect(() => {
+    childrenCacheRef.current = childrenCache;
+  }, [childrenCache]);
+  const accessOrderRef = useRef<string[]>([]);
+  const fetchedAncestorsRef = useRef<Set<string>>(new Set());
+  const activeNodeRef = useRef<HTMLDivElement | null>(null);
+  const lastScrolledKeyRef = useRef<string>("");
 
-  // Détermination dynamique de la racine
-  const rootPath = isRemote
-    ? "/"
-    : currentPath.includes(":")
-    ? currentPath.substring(0, currentPath.indexOf(":") + 1) + "\\"
-    : "C:\\";
+  const touchKeys = (keys: string[]) => {
+    const next = accessOrderRef.current.filter((k) => !keys.includes(k));
+    next.push(...keys);
+    if (next.length > MAX_CACHE_ENTRIES * 2) {
+      next.splice(0, next.length - MAX_CACHE_ENTRIES);
+    }
+    accessOrderRef.current = next;
+  };
+
+  useEffect(() => {
+    if (isRemote) {
+      setExpandedNodes({});
+      setChildrenCache({});
+      setLoadingNodes({});
+      fetchedAncestorsRef.current.clear();
+      lastScrolledKeyRef.current = "";
+    }
+  }, [isRemote, sessionId]);
+
+  const rootPath = isRemote ? "/" : detectLocalRoot(currentPath);
 
   const rootLabel = isRemote
     ? "/ (Racine)"
-    : `Disque local (${rootPath.replace("\\", "")})`;
+    : rootPath === "/"
+    ? "/ (Racine)"
+    : `Disque local (${rootPath.replace(/\\+$/, "")})`;
 
-  const getKey = (p: string) => (isRemote ? p : p.toLowerCase());
+  const getKey = (p: string) => {
+    if (isRemote || rootPath === "/") {
+      const c = p.replace(/\/+$/, "");
+      return c || "/";
+    }
+    const n = p.replace(/\//g, "\\");
+    if (/^[a-zA-Z]:\\?$/.test(n)) {
+      return `${n.slice(0, 2).toLowerCase()}\\`;
+    }
+    return n.replace(/\\+$/, "").toLowerCase();
+  };
 
-  // Auto-déploiement et chargement de la racine et de toute la hiérarchie du chemin actuel
   useEffect(() => {
+    if (!currentPath.trim()) return;
     let isCancelled = false;
 
     const autoExpandAndFetch = async () => {
-      const target = currentPath.trim() || rootPath;
+      const target = currentPath.trim();
       const hierarchy = getPathHierarchy(target, isRemote, rootPath);
 
-      // Déplie tous les dossiers de la hiérarchie menant au dossier actuel
       setExpandedNodes((prev) => {
+        let changed = false;
         const next = { ...prev };
-        hierarchy.forEach((p) => {
-          next[getKey(p)] = true;
-        });
-        return next;
+        for (const p of hierarchy) {
+          const k = getKey(p);
+          if (!next[k]) {
+            next[k] = true;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
       });
 
-      // Met en cache les sous-dossiers déjà connus pour le dossier courant
       const currKey = getKey(target);
-      setChildrenCache((prev) => ({
-        ...prev,
-        [currKey]: subFolders,
-      }));
+      const rootKey = getKey(rootPath);
+      if (!arraysEqual(childrenCacheRef.current[currKey], subFolders)) {
+        touchKeys([rootKey, currKey]);
+        setChildrenCache((prev) =>
+          trimCache(
+            {
+              ...prev,
+              [currKey]: subFolders,
+            },
+            accessOrderRef.current,
+            rootKey
+          )
+        );
+      }
 
-      // Récupère les sous-dossiers de chaque niveau parent non encore en cache (notamment la racine !)
-      for (const p of hierarchy) {
+      const missingPaths = hierarchy.filter((p) => {
         const key = getKey(p);
-        if (key === currKey && subFolders.length > 0) continue;
-        if (childrenCache[key] !== undefined) continue;
+        if (key === currKey) return false;
+        const cached = childrenCacheRef.current[key];
+        if (cached !== undefined && (cached.length > 0 || fetchedAncestorsRef.current.has(key))) {
+          return false;
+        }
+        if (isRemote && !sessionId) return false;
+        return true;
+      });
 
-        try {
-          if (isRemote) {
-            if (!sessionId) continue;
-            const dirs = await invoke<string[]>("list_remote_subdirs", {
-              sessionId,
-              path: p,
-            });
-            if (!isCancelled) {
-              setChildrenCache((prev) => ({ ...prev, [key]: dirs }));
-            }
-          } else {
-            const dirs = await invoke<string[]>("read_local_subdirs", { path: p });
-            if (!isCancelled) {
-              setChildrenCache((prev) => ({ ...prev, [key]: dirs }));
-            }
+      if (missingPaths.length === 0) return;
+
+      const results = await Promise.all(
+        missingPaths.map(async (p) => {
+          const key = getKey(p);
+          fetchedAncestorsRef.current.add(key);
+          try {
+            const dirs = isRemote
+              ? await invoke<string[]>("list_remote_subdirs", { sessionId, path: p })
+              : await invoke<string[]>("read_local_subdirs", { path: p });
+            return [key, dirs] as const;
+          } catch {
+            return null;
           }
-        } catch {}
+        })
+      );
+
+      if (isCancelled) return;
+      const updates: Record<string, string[]> = {};
+      for (const res of results) {
+        if (res) updates[res[0]] = res[1];
+      }
+      const updateKeys = Object.keys(updates);
+      if (updateKeys.length > 0) {
+        touchKeys(updateKeys);
+        setChildrenCache((prev) =>
+          trimCache({ ...prev, ...updates }, accessOrderRef.current, rootKey)
+        );
       }
     };
 
@@ -126,6 +240,19 @@ export default function DirectoryTree({
     };
   }, [currentPath, subFolders, isRemote, rootPath, sessionId]);
 
+  // Défilement automatique vers le dossier actif dès qu'il est rendu dans l'arborescence
+  useEffect(() => {
+    const trimmed = currentPath.trim();
+    if (!trimmed) return;
+    const currKey = getKey(trimmed);
+    if (lastScrolledKeyRef.current === currKey) return;
+    const el = activeNodeRef.current;
+    if (el && el.dataset.nodeKey === currKey) {
+      lastScrolledKeyRef.current = currKey;
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [currentPath, childrenCache, expandedNodes, isRemote, rootPath, sessionId]);
+
   const toggleExpand = async (targetPath: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const key = getKey(targetPath);
@@ -134,18 +261,29 @@ export default function DirectoryTree({
 
     setExpandedNodes((prev) => ({ ...prev, [key]: isNowExpanded }));
 
-    if (isNowExpanded && childrenCache[key] === undefined) {
+    if (isNowExpanded && childrenCacheRef.current[key] === undefined) {
+      const rootKey = getKey(rootPath);
       setLoadingNodes((prev) => ({ ...prev, [key]: true }));
       try {
         if (isRemote) {
+          if (!sessionId) {
+            setChildrenCache((prev) => ({ ...prev, [key]: [] }));
+            return;
+          }
           const dirs = await invoke<string[]>("list_remote_subdirs", {
-            sessionId: sessionId || "default",
+            sessionId,
             path: targetPath,
           });
-          setChildrenCache((prev) => ({ ...prev, [key]: dirs }));
+          touchKeys([key]);
+          setChildrenCache((prev) =>
+            trimCache({ ...prev, [key]: dirs }, accessOrderRef.current, rootKey)
+          );
         } else {
           const dirs = await invoke<string[]>("read_local_subdirs", { path: targetPath });
-          setChildrenCache((prev) => ({ ...prev, [key]: dirs }));
+          touchKeys([key]);
+          setChildrenCache((prev) =>
+            trimCache({ ...prev, [key]: dirs }, accessOrderRef.current, rootKey)
+          );
         }
       } catch {
         setChildrenCache((prev) => ({ ...prev, [key]: [] }));
@@ -167,6 +305,8 @@ export default function DirectoryTree({
     return (
       <div key={fullPath} className="flex flex-col">
         <div
+          ref={isCurrent ? activeNodeRef : undefined}
+          data-node-key={key}
           style={{ paddingLeft: `${depth * 14}px` }}
           onClick={() => onNavigate(fullPath)}
           className={`flex items-center gap-1.5 py-0.5 px-1.5 rounded cursor-pointer group transition text-[11px] ${
@@ -212,8 +352,9 @@ export default function DirectoryTree({
         {isExpanded && knownChildren && knownChildren.length > 0 && (
           <div className="flex flex-col">
             {knownChildren.map((childName) => {
-              const childPath = isRemote
-                ? `${fullPath.replace(/\/+$/, "")}/${childName}`
+              const isPosix = isRemote || rootPath === "/";
+              const childPath = isPosix
+                ? `${fullPath === "/" ? "" : fullPath.replace(/\/+$/, "")}/${childName}`
                 : `${fullPath.replace(/\\+$/, "")}\\${childName}`;
               return renderFolderNode(childName, childPath, depth + 1);
             })}
@@ -223,9 +364,19 @@ export default function DirectoryTree({
     );
   };
 
+  if (!currentPath.trim()) {
+    return (
+      <div className="p-3 text-neutral-500 text-xs font-mono">
+        Chargement de l'arborescence...
+      </div>
+    );
+  }
+
   return (
     <div className={`p-1 font-mono text-xs select-none ${isDark ? "text-neutral-200" : "text-neutral-800"}`}>
       {renderFolderNode(rootLabel, rootPath, 0)}
     </div>
   );
 }
+
+export default memo(DirectoryTreeComponent);

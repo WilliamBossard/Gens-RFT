@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { FileEdit, Search, Save, X, ChevronLeft, ChevronRight, AlertTriangle } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface EditorModalState {
+  sessionId?: string;
   path: string;
   filename: string;
   content: string;
@@ -15,9 +16,23 @@ interface Props {
   editorModal: EditorModalState | null;
   onClose: () => void;
   activeTabId: string;
-  onSuccess?: () => void;
+  onSuccess?: (sessionId: string) => void;
   logMessage: (msg: string) => void;
   isDark?: boolean;
+}
+
+const LINE_HEIGHT = 20;
+const OVERSCAN_LINES = 10;
+
+function countLines(text: string): number {
+  if (!text) return 1;
+  let count = 1;
+  let idx = text.indexOf("\n");
+  while (idx !== -1) {
+    count++;
+    idx = text.indexOf("\n", idx + 1);
+  }
+  return count;
 }
 
 export default function FileEditorModal({
@@ -36,9 +51,11 @@ export default function FileEditorModal({
   const [searchMatches, setSearchMatches] = useState<number[]>([]);
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const [showConfirmClose, setShowConfirmClose] = useState(false);
+  const [showConfirmLossySave, setShowConfirmLossySave] = useState(false);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(480);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const lineNumbersRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (editorModal) {
@@ -46,48 +63,85 @@ export default function FileEditorModal({
       setOriginalContent(editorModal.originalContent);
       setSaving(false);
       setShowSearch(false);
+      setShowConfirmClose(false);
+      setShowConfirmLossySave(false);
       setSearchQuery("");
+      setScrollTop(0);
     }
   }, [editorModal]);
 
   useEffect(() => {
-    if (!searchQuery) {
+    if (!textareaRef.current) return;
+    const el = textareaRef.current;
+    setViewportHeight(el.clientHeight || 480);
+    const ro = new ResizeObserver(() => {
+      if (textareaRef.current) {
+        setViewportHeight(textareaRef.current.clientHeight || 480);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [editorModal]);
+
+  useEffect(() => {
+    if (!showSearch || !searchQuery) {
       setSearchMatches([]);
       setCurrentMatchIndex(0);
       return;
     }
-    const q = searchQuery.toLowerCase();
-    const c = content.toLowerCase();
-    const matches: number[] = [];
-    let pos = c.indexOf(q);
-    while (pos !== -1 && matches.length < 1000) {
-      matches.push(pos);
-      pos = c.indexOf(q, pos + 1);
-    }
-    setSearchMatches(matches);
-    setCurrentMatchIndex(matches.length > 0 ? 0 : -1);
-  }, [searchQuery, content]);
+    const timer = setTimeout(() => {
+      const q = searchQuery.toLowerCase();
+      const c = content.toLowerCase();
+      const matches: number[] = [];
+      let pos = c.indexOf(q);
+      while (pos !== -1 && matches.length < 1000) {
+        matches.push(pos);
+        pos = c.indexOf(q, pos + 1);
+      }
+      setSearchMatches(matches);
+      setCurrentMatchIndex(matches.length > 0 ? 0 : -1);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [showSearch, searchQuery, content]);
+
+  const totalLines = useMemo(() => countLines(content), [content]);
+
+  const { startLine, endLine } = useMemo(() => {
+    const first = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - OVERSCAN_LINES);
+    const visibleCount = Math.ceil(viewportHeight / LINE_HEIGHT) + OVERSCAN_LINES * 2;
+    const last = Math.min(totalLines, first + visibleCount);
+    return { startLine: first, endLine: last };
+  }, [scrollTop, viewportHeight, totalLines]);
 
   if (!editorModal) return null;
 
   const hasUnsavedChanges = content !== originalContent;
 
-  const handleSave = async () => {
+  const performSave = async () => {
+    const targetSessionId = editorModal.sessionId || activeTabId;
     setSaving(true);
     try {
       await invoke("save_remote_file_text", {
-        sessionId: activeTabId,
+        sessionId: targetSessionId,
         remotePath: editorModal.path,
         content,
       });
       logMessage(`Fichier sauvegardé avec succès : ${editorModal.filename}`);
       setOriginalContent(content);
-      onSuccess?.();
+      onSuccess?.(targetSessionId);
     } catch (err) {
       logMessage(`Erreur de sauvegarde : ${err}`);
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSave = async () => {
+    if (editorModal.isLossy) {
+      setShowConfirmLossySave(true);
+      return;
+    }
+    await performSave();
   };
 
   const jumpToMatch = (idx: number) => {
@@ -108,6 +162,11 @@ export default function FileEditorModal({
     }
   };
 
+  const visibleLineNumbers: number[] = [];
+  for (let i = startLine; i < endLine; i++) {
+    visibleLineNumbers.push(i + 1);
+  }
+
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
@@ -115,7 +174,34 @@ export default function FileEditorModal({
           isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-white text-neutral-800"
         }`}
       >
-        {/* Boîte de dialogue de confirmation si modifications non enregistrées */}
+        {showConfirmLossySave && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-100">
+            <div className={`w-80 rounded-xl border p-4 shadow-2xl space-y-3 ${isDark ? "bg-neutral-900 border-neutral-700 text-neutral-200" : "bg-white border-neutral-300 text-neutral-800"}`}>
+              <h4 className="font-semibold text-xs text-amber-400">Encodage non-UTF-8 détecté</h4>
+              <p className="text-[11px] text-neutral-400">
+                Ce fichier contient des caractères non-UTF-8 qui ont été remplacés lors de la lecture. Enregistrer maintenant réécrira le fichier en UTF-8 et risque d'altérer définitivement certains caractères.
+              </p>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setShowConfirmLossySave(false)}
+                  className="px-3 py-1 rounded border border-neutral-700 text-xs text-neutral-300 hover:bg-neutral-800 cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  onClick={async () => {
+                    setShowConfirmLossySave(false);
+                    await performSave();
+                  }}
+                  className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 font-semibold text-xs text-white cursor-pointer"
+                >
+                  Enregistrer quand même
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {showConfirmClose && (
           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-100">
             <div className={`w-80 rounded-xl border p-4 shadow-2xl space-y-3 ${isDark ? "bg-neutral-900 border-neutral-700 text-neutral-200" : "bg-white border-neutral-300 text-neutral-800"}`}>
@@ -146,15 +232,15 @@ export default function FileEditorModal({
 
         {/* Header */}
         <div className="flex items-center justify-between border-b px-4 py-2 border-neutral-700/50">
-          <div className="flex items-center gap-2">
-            <FileEdit className="h-4 w-4 text-sky-400" />
-            <span className="font-semibold text-xs font-mono">{editorModal.filename}</span>
-            <span className="text-[11px] text-neutral-500">({editorModal.path})</span>
+          <div className="flex items-center gap-2 min-w-0">
+            <FileEdit className="h-4 w-4 text-sky-400 shrink-0" />
+            <span className="font-semibold text-xs font-mono truncate">{editorModal.filename}</span>
+            <span className="text-[11px] text-neutral-500 truncate">({editorModal.path})</span>
             {hasUnsavedChanges && (
-              <span className="h-2 w-2 rounded-full bg-amber-400" title="Modifications non enregistrées" />
+              <span className="h-2 w-2 rounded-full bg-amber-400 shrink-0" title="Modifications non enregistrées" />
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={() => setShowSearch(!showSearch)}
               className={`p-1.5 rounded text-xs flex items-center gap-1 border transition cursor-pointer ${
@@ -186,7 +272,6 @@ export default function FileEditorModal({
           </div>
         </div>
 
-        {/* Alerte encodage non-UTF-8 */}
         {editorModal.isLossy && (
           <div className="flex items-center gap-2 px-4 py-1.5 bg-amber-500/15 border-b border-amber-500/30 text-amber-400 text-[11px]">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
@@ -197,7 +282,6 @@ export default function FileEditorModal({
           </div>
         )}
 
-        {/* Barre de recherche */}
         {showSearch && (
           <div className="flex items-center justify-between border-b px-3 py-1.5 bg-neutral-950/90 border-neutral-800 gap-2">
             <div className="flex items-center gap-2 flex-1">
@@ -260,17 +344,21 @@ export default function FileEditorModal({
           </div>
         )}
 
-        {/* Zone de code */}
+        {/* Zone de code avec numéros de ligne virtualisés */}
         <div className="flex-1 bg-neutral-950 flex overflow-hidden font-mono text-xs relative">
-          <div
-            ref={lineNumbersRef}
-            className="w-12 py-2 pr-2 text-right bg-neutral-900/60 text-neutral-600 border-r border-neutral-800/80 select-none overflow-hidden font-mono text-xs"
-          >
-            {content.split("\n").map((_, i) => (
-              <div key={i} className="h-[20px] leading-[20px]">
-                {i + 1}
-              </div>
-            ))}
+          <div className="w-14 bg-neutral-900/60 text-neutral-600 border-r border-neutral-800/80 select-none overflow-hidden font-mono text-xs relative shrink-0">
+            <div
+              style={{
+                transform: `translateY(${startLine * LINE_HEIGHT - scrollTop + 8}px)`,
+              }}
+              className="pr-2 text-right"
+            >
+              {visibleLineNumbers.map((lineNum) => (
+                <div key={lineNum} className="h-[20px] leading-[20px]">
+                  {lineNum}
+                </div>
+              ))}
+            </div>
           </div>
 
           <textarea
@@ -278,11 +366,7 @@ export default function FileEditorModal({
             autoFocus
             value={content}
             onChange={(e) => setContent(e.target.value)}
-            onScroll={(e) => {
-              if (lineNumbersRef.current) {
-                lineNumbersRef.current.scrollTop = e.currentTarget.scrollTop;
-              }
-            }}
+            onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
             onKeyDown={async (e) => {
               if (e.ctrlKey && e.key.toLowerCase() === "s") {
                 e.preventDefault();
@@ -309,7 +393,7 @@ export default function FileEditorModal({
         {/* Footer */}
         <div className="flex items-center justify-between border-t border-neutral-800 px-4 py-1.5 text-[11px] text-neutral-500">
           <div className="flex items-center gap-3">
-            <span>Lignes : {content.split("\n").length}</span>
+            <span>Lignes : {totalLines}</span>
             <span>Caractères : {content.length}</span>
           </div>
           <div className="flex items-center gap-3 text-[10px]">
@@ -321,4 +405,3 @@ export default function FileEditorModal({
     </div>
   );
 }
-

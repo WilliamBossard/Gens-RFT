@@ -6,6 +6,72 @@ export function isArchiveFile(name: string): boolean {
   return n.endsWith(".zip") || n.endsWith(".tar.gz") || n.endsWith(".tgz") || n.endsWith(".tar");
 }
 
+const DANGEROUS_EXECUTABLE_RE =
+  /\.(exe|bat|cmd|ps1|psm1|psd1|ps1xml|vbs|vbe|vba|js|jse|ws|wsc|wsf|wsh|hta|msi|msp|mst|msix|appx|appxbundle|msixbundle|appinstaller|msu|scr|com|pif|reg|sh|bash|zsh|lnk|msc|cpl|url|jar|jnlp|doc|docm|xls|xlsm|ppt|pptm|xll|wll|iqy|slk|inf|sct|chm|iso|img|vhd|vhdx|appref-ms|library-ms|search-ms|settingcontent-ms|diagcab|application|svg|html|htm|py|pyw|pyz|pyc|rb|pl|scf|gadget|dll|ocx|sys|desktop|command|pkg|dmg|rdp|ica|msh|msh1|msh2|mshxml|website)$/i;
+
+export function isDangerousExecutable(name: string): boolean {
+  const trimmed = name.replace(/[. ]+$/, "");
+  return DANGEROUS_EXECUTABLE_RE.test(trimmed);
+}
+
+export function buildCopyFilename(
+  filename: string,
+  isDir: boolean,
+  existingNames?: Set<string>
+): string {
+  const splitName = (raw: string): [string, string] => {
+    if (isDir) return [raw, ""];
+    const lower = raw.toLowerCase();
+    for (const multiExt of [".tar.gz", ".tar.bz2", ".tar.xz"]) {
+      if (lower.endsWith(multiExt) && raw.length > multiExt.length) {
+        const idx = raw.length - multiExt.length;
+        return [raw.slice(0, idx), raw.slice(idx)];
+      }
+    }
+    const extIdx = raw.lastIndexOf(".");
+    if (extIdx > 0) {
+      return [raw.slice(0, extIdx), raw.slice(extIdx)];
+    }
+    return [raw, ""];
+  };
+
+  const [stem, ext] = splitName(filename);
+  const firstCandidate = `${stem} (copie)${ext}`;
+  if (!existingNames || !existingNames.has(firstCandidate.toLowerCase())) {
+    existingNames?.add(firstCandidate.toLowerCase());
+    return firstCandidate;
+  }
+
+  let counter = 2;
+  while (true) {
+    const candidate = `${stem} (copie ${counter})${ext}`;
+    if (!existingNames.has(candidate.toLowerCase())) {
+      existingNames.add(candidate.toLowerCase());
+      return candidate;
+    }
+    counter++;
+  }
+}
+
+export function isValidFilenameInput(name: string, isRemote: boolean): boolean {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed === "." || trimmed === "..") return false;
+  if (/[\x00-\x1f\x7f/\\]/.test(trimmed)) return false;
+  if (!isRemote && /[<>:"|?*]/.test(trimmed)) return false;
+  return true;
+}
+
+export function joinLocalPath(baseDir: string, name: string): string {
+  const sep = baseDir.includes("/") && !baseDir.includes("\\") ? "/" : "\\";
+  const clean = baseDir.replace(/[\\/]+$/, "");
+  return `${clean}${sep}${name}`;
+}
+
+export function joinRemotePath(baseDir: string, name: string): string {
+  if (!baseDir || baseDir === "/") return `/${name}`;
+  return `${baseDir.replace(/\/+$/, "")}/${name}`;
+}
+
 export function isEditableTextFile(name: string): boolean {
   const ext = name.split(".").pop()?.toLowerCase() || "";
   const nonEditable = [
@@ -72,4 +138,3 @@ export function formatFileSize(bytes: number): string {
   }
   return `${bytes} o`;
 }
-

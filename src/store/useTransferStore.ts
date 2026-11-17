@@ -35,6 +35,12 @@ interface TransferStore {
   retryAllFailed: () => void;
 }
 
+function generateTransferId(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
 export const useTransferStore = create<TransferStore>((set) => ({
   queue: [],
   maxConcurrent: 2,
@@ -44,7 +50,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
   addToQueue: (params) => {
     const newItem: QueueItem = {
       ...params,
-      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      id: generateTransferId(),
       status: "queued",
       percent: 0,
       speed: "-- Mo/s",
@@ -61,6 +67,19 @@ export const useTransferStore = create<TransferStore>((set) => ({
     set((state) => ({
       queue: state.queue.map((item) => {
         if (item.id !== transferId) return item;
+
+        // Réinitialiser la baseline si un relais passe du download à l'upload
+        if (transferred < item.lastBytes) {
+          return {
+            ...item,
+            percent: safePercent,
+            speed: "-- Mo/s",
+            eta: "--",
+            lastBytes: transferred,
+            lastTimestamp: now,
+          };
+        }
+
         const deltaSec = (now - item.lastTimestamp) / 1000;
         let newSpeed = item.speed;
         let newEta = item.eta;
@@ -101,18 +120,28 @@ export const useTransferStore = create<TransferStore>((set) => ({
 
   markStatus: (id, status, errorReason) => {
     set((state) => ({
-      queue: state.queue.map((it) =>
-        it.id === id
-          ? {
-              ...it,
-              status,
-              errorReason: status === "error" ? errorReason : undefined,
-              percent: status === "done" ? 100 : it.percent,
-              speed: status === "done" ? "Terminé" : status === "error" ? "Échec" : it.speed,
-              eta: status === "done" ? "0s" : status === "error" ? "--" : it.eta,
-            }
-          : it
-      ),
+      queue: state.queue.map((it) => {
+        if (it.id !== id) return it;
+        const isCancelled =
+          status === "error" &&
+          (it.speed === "Annulé" ||
+            (errorReason && errorReason.toLowerCase().includes("annulé")));
+        return {
+          ...it,
+          status,
+          errorReason: status === "error" ? errorReason || it.errorReason : undefined,
+          percent: status === "done" ? 100 : it.percent,
+          speed:
+            status === "done"
+              ? "Terminé"
+              : status === "error"
+              ? isCancelled
+                ? "Annulé"
+                : "Échec"
+              : it.speed,
+          eta: status === "done" ? "0s" : status === "error" ? "--" : it.eta,
+        };
+      }),
     }));
   },
 
@@ -123,27 +152,50 @@ export const useTransferStore = create<TransferStore>((set) => ({
   },
 
   cancelAll: async () => {
-    await invoke("cancel_current_transfer", { transferId: null });
     set((state) => ({
       queue: state.queue.map((it) =>
-        it.status === "queued" || it.status === "running" ? { ...it, status: "error", speed: "Annulé" } : it
+        it.status === "queued" || it.status === "running"
+          ? { ...it, status: "error", speed: "Annulé", errorReason: "Annulé par l'utilisateur" }
+          : it
       ),
     }));
+    await invoke("cancel_current_transfer", { transferId: null }).catch(() => {});
   },
 
   cancelItem: async (id: string) => {
-    await invoke("cancel_current_transfer", { transferId: id });
+    let wasRunning = false;
     set((state) => ({
-      queue: state.queue.map((it) =>
-        it.id === id ? { ...it, status: "error", speed: "Annulé" } : it
-      ),
+      queue: state.queue.map((it) => {
+        if (it.id === id && (it.status === "queued" || it.status === "running")) {
+          if (it.status === "running") {
+            wasRunning = true;
+          }
+          return { ...it, status: "error", speed: "Annulé", errorReason: "Annulé par l'utilisateur" };
+        }
+        return it;
+      }),
     }));
+    if (wasRunning) {
+      await invoke("cancel_current_transfer", { transferId: id }).catch(() => {});
+    }
   },
 
   retryItem: (id) => {
     set((state) => ({
       queue: state.queue.map((it) =>
-        it.id === id ? { ...it, status: "queued", percent: 0, speed: "-- Mo/s", eta: "--", lastBytes: 0, lastTimestamp: Date.now() } : it
+        it.id === id && it.status === "error"
+          ? {
+              ...it,
+              id: generateTransferId(),
+              status: "queued",
+              errorReason: undefined,
+              percent: 0,
+              speed: "-- Mo/s",
+              eta: "--",
+              lastBytes: 0,
+              lastTimestamp: Date.now(),
+            }
+          : it
       ),
     }));
   },
@@ -151,7 +203,19 @@ export const useTransferStore = create<TransferStore>((set) => ({
   retryAllFailed: () => {
     set((state) => ({
       queue: state.queue.map((it) =>
-        it.status === "error" ? { ...it, status: "queued", percent: 0, speed: "-- Mo/s", eta: "--", lastBytes: 0, lastTimestamp: Date.now() } : it
+        it.status === "error"
+          ? {
+              ...it,
+              id: generateTransferId(),
+              status: "queued",
+              errorReason: undefined,
+              percent: 0,
+              speed: "-- Mo/s",
+              eta: "--",
+              lastBytes: 0,
+              lastTimestamp: Date.now(),
+            }
+          : it
       ),
     }));
   },

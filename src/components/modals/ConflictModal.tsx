@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
 export interface ConflictModalState {
@@ -15,6 +15,10 @@ interface Props {
 
 export default function ConflictModal({ conflictModal, onClose, isDark = true }: Props) {
   const [applyToAll, setApplyToAll] = useState(false);
+
+  useEffect(() => {
+    setApplyToAll(false);
+  }, [conflictModal]);
 
   if (!conflictModal) return null;
 

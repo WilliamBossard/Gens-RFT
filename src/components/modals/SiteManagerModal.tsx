@@ -1,7 +1,11 @@
 import { useState, useEffect, useRef } from "react";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { decryptVaultData, exportVaultData } from "../../utils/cryptoVault";
+import {
+  decryptVaultDataStrict,
+  exportVaultData,
+  isPasswordProtectedExport,
+} from "../../utils/cryptoVault";
 import {
   SlidersHorizontal,
   X,
@@ -26,6 +30,7 @@ export interface SiteProfile {
   passphrase?: string;
   lastRemotePath?: string;
   lastLocalPath?: string;
+  acceptInvalidCerts?: boolean;
 }
 
 interface Props {
@@ -36,6 +41,7 @@ interface Props {
   onConnect: (site: SiteProfile) => void;
   isDark: boolean;
   logMessage: (msg: string) => void;
+  vaultLoadFailed?: boolean;
 }
 
 export default function SiteManagerModal({
@@ -46,6 +52,7 @@ export default function SiteManagerModal({
   onConnect,
   isDark,
   logMessage,
+  vaultLoadFailed = false,
 }: Props) {
   const [selectedSiteId, setSelectedSiteId] = useState<string | null>(sites[0]?.id || null);
   const [siteForm, setSiteForm] = useState<SiteProfile>(
@@ -62,6 +69,13 @@ export default function SiteManagerModal({
   );
 
   const prevIsOpenRef = useRef(false);
+  const [vaultPwdPrompt, setVaultPwdPrompt] = useState<{
+    mode: "export" | "import";
+    pendingRaw?: string;
+  } | null>(null);
+  const [vaultPwdInput, setVaultPwdInput] = useState("");
+  const [vaultPwdError, setVaultPwdError] = useState("");
+  const [plaintextImportPending, setPlaintextImportPending] = useState<string | null>(null);
 
   useEffect(() => {
     // Ne synchroniser à l'ouverture que si la modale vient de s'ouvrir
@@ -84,9 +98,17 @@ export default function SiteManagerModal({
     prevIsOpenRef.current = isOpen;
   }, [isOpen, sites, selectedSiteId]);
 
-  const handleSelectSite = (site: SiteProfile) => {
+  const getSyncedSites = (): SiteProfile[] => {
     if (selectedSiteId && siteForm.id === selectedSiteId) {
-      setSites(sites.map((s) => (s.id === selectedSiteId ? siteForm : s)));
+      return sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
+    }
+    return sites;
+  };
+
+  const handleSelectSite = (site: SiteProfile) => {
+    const synced = getSyncedSites();
+    if (synced !== sites) {
+      setSites(synced);
     }
     setSelectedSiteId(site.id);
     setSiteForm(site);
@@ -94,8 +116,12 @@ export default function SiteManagerModal({
 
   if (!isOpen) return null;
 
-  const handleExportWithPicker = async () => {
+  const runExportWithPassword = async (password: string) => {
     try {
+      const synced = getSyncedSites();
+      if (synced !== sites) {
+        setSites(synced);
+      }
       const defaultFileName = `gens_rft_sites_${new Date().toISOString().slice(0, 10)}.json`;
       const filePath = await save({
         filters: [{ name: "Fichier JSON", extensions: ["json"] }],
@@ -103,42 +129,67 @@ export default function SiteManagerModal({
       });
 
       if (filePath) {
-        // Chiffrement AES-GCM portable pour protéger les mots de passe et identifiants
-        const encryptedContent = await exportVaultData(sites);
+        const encryptedContent = await exportVaultData(synced, password);
         await invoke("export_sites_to_path", { filePath, jsonContent: encryptedContent });
-        logMessage(`Serveurs exportés de manière sécurisée (chiffrée) vers : ${filePath}`);
+        logMessage(`Serveurs exportés avec chiffrement vers : ${filePath}`);
       }
     } catch (err) {
       logMessage(`Erreur export : ${err}`);
     }
   };
 
+  const handleExportWithPicker = () => {
+    setVaultPwdInput("");
+    setVaultPwdError("");
+    setVaultPwdPrompt({ mode: "export" });
+  };
+
+  const applyImportedRaw = async (raw: string, password?: string) => {
+    try {
+      let parsed: unknown;
+      if (raw.startsWith("enc:")) {
+        if (!isPasswordProtectedExport(raw)) {
+          throw new Error("Ce format de fichier chiffré interne ne peut pas être importé sans mot de passe.");
+        }
+        parsed = await decryptVaultDataStrict<SiteProfile[]>(raw, password);
+        if (!Array.isArray(parsed)) {
+          throw new Error("Déchiffrement impossible (mot de passe incorrect ou format invalide).");
+        }
+      } else {
+        parsed = JSON.parse(raw);
+      }
+      if (!Array.isArray(parsed)) throw new Error("Format de fichier non valide.");
+      const map = new Map<string, SiteProfile>();
+      sites.forEach((s) => map.set(s.id, s));
+      parsed.forEach((s: SiteProfile) => {
+        if (s.name && s.host) {
+          const id = s.id || `site_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+          map.set(id, { ...s, id });
+        }
+      });
+      const updated = Array.from(map.values());
+      setSites(updated);
+      logMessage(`Import réussi : ${updated.length} profils chargés.`);
+    } catch (err) {
+      logMessage(`Erreur import : ${err}`);
+    }
+  };
+
   const handleImport = (file: File) => {
     const reader = new FileReader();
     reader.onload = async (e) => {
-      try {
-        const raw = (e.target?.result as string).trim();
-        let parsed: any;
-        if (raw.startsWith("enc:")) {
-          parsed = await decryptVaultData<SiteProfile[]>(raw, []);
-        } else {
-          parsed = JSON.parse(raw);
-        }
-        if (!Array.isArray(parsed)) throw new Error("Format de fichier non valide.");
-        const map = new Map<string, SiteProfile>();
-        sites.forEach((s) => map.set(s.id, s));
-        parsed.forEach((s: SiteProfile) => {
-          if (s.name && s.host) {
-            const id = s.id || `site_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-            map.set(id, { ...s, id });
-          }
-        });
-        const updated = Array.from(map.values());
-        setSites(updated);
-        logMessage(`Import réussi : ${updated.length} profils chargés.`);
-      } catch (err) {
-        logMessage(`Erreur import : ${err}`);
+      const raw = ((e.target?.result as string) || "").trim();
+      if (isPasswordProtectedExport(raw)) {
+        setVaultPwdInput("");
+        setVaultPwdError("");
+        setVaultPwdPrompt({ mode: "import", pendingRaw: raw });
+        return;
       }
+      if (!raw.startsWith("enc:")) {
+        setPlaintextImportPending(raw);
+        return;
+      }
+      await applyImportedRaw(raw);
     };
     reader.readAsText(file);
   };
@@ -190,9 +241,10 @@ export default function SiteManagerModal({
               <div className="flex gap-2">
                 <button
                   onClick={() => {
+                    const synced = getSyncedSites();
                     const newSite: SiteProfile = {
                       id: Date.now().toString(),
-                      name: `Serveur ${sites.length + 1}`,
+                      name: `Serveur ${synced.length + 1}`,
                       protocol: "SFTP",
                       host: "",
                       port: "22",
@@ -200,7 +252,7 @@ export default function SiteManagerModal({
                       username: "",
                       password: "",
                     };
-                    setSites([...sites, newSite]);
+                    setSites([...synced, newSite]);
                     setSelectedSiteId(newSite.id);
                     setSiteForm(newSite);
                   }}
@@ -211,7 +263,8 @@ export default function SiteManagerModal({
                 {selectedSiteId && (
                   <button
                     onClick={() => {
-                      setSites(sites.filter((s) => s.id !== selectedSiteId));
+                      const synced = getSyncedSites();
+                      setSites(synced.filter((s) => s.id !== selectedSiteId));
                       setSelectedSiteId(null);
                     }}
                     className="px-2 py-1.5 rounded border border-rose-500/30 text-rose-500 hover:bg-rose-500/10 text-xs cursor-pointer transition active:scale-95"
@@ -232,6 +285,7 @@ export default function SiteManagerModal({
                     onChange={(e) => {
                       const file = e.target.files?.[0];
                       if (file) handleImport(file);
+                      e.target.value = "";
                     }}
                   />
                 </label>
@@ -283,6 +337,20 @@ export default function SiteManagerModal({
                     </select>
                   </div>
                 </div>
+
+                {siteForm.protocol === "FTPS" && (
+                  <label className="flex items-center gap-2 cursor-pointer text-[11px] text-amber-400">
+                    <input
+                      type="checkbox"
+                      checked={!!siteForm.acceptInvalidCerts}
+                      onChange={(e) =>
+                        setSiteForm({ ...siteForm, acceptInvalidCerts: e.target.checked })
+                      }
+                      className="rounded cursor-pointer"
+                    />
+                    <span>Accepter les certificats TLS auto-signés ou invalides (non recommandé)</span>
+                  </label>
+                )}
 
                 <div className="grid grid-cols-3 gap-4">
                   <div className="col-span-2">
@@ -428,8 +496,13 @@ export default function SiteManagerModal({
         <div className="flex items-center justify-between border-t border-neutral-500/20 px-4 py-3">
           <button
             onClick={() => {
+              if (vaultLoadFailed) {
+                logMessage("Sauvegarde bloquée : le coffre initial n'a pas pu être déchiffré (protection anti-écrasement).");
+                return;
+              }
               if (selectedSiteId) {
-                setSites(sites.map((s) => (s.id === selectedSiteId ? siteForm : s)));
+                const updated = sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
+                setSites(updated);
                 logMessage("Profil sauvegardé.");
               }
             }}
@@ -447,7 +520,10 @@ export default function SiteManagerModal({
             <button
               onClick={() => {
                 if (selectedSiteId) {
-                  setSites(sites.map((s) => (s.id === selectedSiteId ? siteForm : s)));
+                  if (!vaultLoadFailed) {
+                    const updated = sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
+                    setSites(updated);
+                  }
                   onConnect(siteForm);
                   onClose();
                 }
@@ -458,6 +534,127 @@ export default function SiteManagerModal({
             </button>
           </div>
         </div>
+
+        {plaintextImportPending !== null && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4">
+            <div
+              className={`w-80 rounded-xl border p-4 shadow-2xl space-y-3 ${
+                isDark
+                  ? "bg-neutral-900 border-neutral-700 text-neutral-200"
+                  : "bg-white border-neutral-300 text-neutral-800"
+              }`}
+            >
+              <h4 className="font-semibold text-xs text-amber-400">
+                Fichier d'import non chiffré
+              </h4>
+              <p className="text-[11px] text-neutral-400">
+                Ce fichier JSON contient des profils en clair (non protégés par mot de passe). Voulez-vous tout de même importer ces serveurs dans votre coffre chiffré local ?
+              </p>
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  onClick={() => setPlaintextImportPending(null)}
+                  className="px-3 py-1 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  onClick={async () => {
+                    const raw = plaintextImportPending;
+                    setPlaintextImportPending(null);
+                    await applyImportedRaw(raw);
+                  }}
+                  className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 font-semibold text-xs text-white cursor-pointer"
+                >
+                  Importer quand même
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {vaultPwdPrompt && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4">
+            <div
+              className={`w-80 rounded-xl border p-4 shadow-2xl space-y-3 ${
+                isDark
+                  ? "bg-neutral-900 border-neutral-700 text-neutral-200"
+                  : "bg-white border-neutral-300 text-neutral-800"
+              }`}
+            >
+              <h4 className="font-semibold text-xs text-sky-400">
+                {vaultPwdPrompt.mode === "export"
+                  ? "Mot de passe d'export (obligatoire)"
+                  : "Fichier protégé par mot de passe"}
+              </h4>
+              <p className="text-[11px] text-neutral-400">
+                {vaultPwdPrompt.mode === "export"
+                  ? "Saisissez un mot de passe (minimum 8 caractères) pour chiffrer vos identifiants exportés."
+                  : "Saisissez le mot de passe utilisé lors de l'export de ce fichier."}
+              </p>
+              <input
+                type="password"
+                autoFocus
+                placeholder="Mot de passe..."
+                value={vaultPwdInput}
+                onChange={(e) => {
+                  setVaultPwdInput(e.target.value);
+                  setVaultPwdError("");
+                }}
+                onKeyDown={async (e) => {
+                  if (e.key === "Enter") {
+                    const p = vaultPwdPrompt;
+                    if (p.mode === "export" && vaultPwdInput.trim().length < 8) {
+                      setVaultPwdError("Minimum 8 caractères requis.");
+                      return;
+                    }
+                    setVaultPwdPrompt(null);
+                    if (p.mode === "export") {
+                      await runExportWithPassword(vaultPwdInput);
+                    } else if (p.pendingRaw) {
+                      await applyImportedRaw(p.pendingRaw, vaultPwdInput);
+                    }
+                  } else if (e.key === "Escape") {
+                    setVaultPwdPrompt(null);
+                  }
+                }}
+                className={`w-full rounded border px-2.5 py-1.5 text-xs focus:outline-none ${
+                  isDark
+                    ? "bg-neutral-950 border-neutral-700 text-neutral-100"
+                    : "bg-neutral-50 border-neutral-300 text-neutral-900"
+                }`}
+              />
+              {vaultPwdError && (
+                <p className="text-[11px] text-rose-400">{vaultPwdError}</p>
+              )}
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  onClick={() => setVaultPwdPrompt(null)}
+                  className="px-3 py-1 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  onClick={async () => {
+                    const p = vaultPwdPrompt;
+                    if (p.mode === "export" && vaultPwdInput.trim().length < 8) {
+                      setVaultPwdError("Minimum 8 caractères requis.");
+                      return;
+                    }
+                    setVaultPwdPrompt(null);
+                    if (p.mode === "export") {
+                      await runExportWithPassword(vaultPwdInput);
+                    } else if (p.pendingRaw) {
+                      await applyImportedRaw(p.pendingRaw, vaultPwdInput);
+                    }
+                  }}
+                  className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 font-semibold text-xs text-white cursor-pointer"
+                >
+                  Confirmer
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

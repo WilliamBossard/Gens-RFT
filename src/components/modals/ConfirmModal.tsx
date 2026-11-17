@@ -31,12 +31,14 @@ export default function ConfirmModal({ confirmModal, onClose, isDark = true }: P
         </div>
         <p className="text-xs text-neutral-400 leading-relaxed">{confirmModal.message}</p>
         <div className="flex justify-end gap-2 pt-1">
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
-          >
-            Annuler
-          </button>
+          {!confirmModal.infoOnly && (
+            <button
+              onClick={onClose}
+              className="px-3 py-1.5 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer transition"
+            >
+              Annuler
+            </button>
+          )}
           <button
             onClick={() => {
               confirmModal.onConfirm();
@@ -44,7 +46,7 @@ export default function ConfirmModal({ confirmModal, onClose, isDark = true }: P
             }}
             className="px-3 py-1.5 rounded bg-rose-600 font-semibold text-xs text-white hover:bg-rose-500 cursor-pointer transition active:scale-95"
           >
-            Confirmer
+            {confirmModal.infoOnly ? "Compris" : "Confirmer"}
           </button>
         </div>
       </div>

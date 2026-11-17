@@ -1,3 +1,4 @@
+import { memo } from "react";
 import {
   FilePlus,
   FolderPlus,
@@ -15,7 +16,14 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { ContextMenuState, FileEntry, TabSession } from "../../types";
-import { isArchiveFile, isEditableTextFile } from "../../utils/fileHelpers";
+import {
+  isArchiveFile,
+  isDangerousExecutable,
+  isEditableTextFile,
+  isValidFilenameInput,
+  joinLocalPath,
+  joinRemotePath,
+} from "../../utils/fileHelpers";
 import { EditorModalState } from "../modals/FileEditorModal";
 import { ChmodModalState } from "../modals/ChmodModal";
 
@@ -56,7 +64,7 @@ interface Props {
   logMessage: (msg: string) => void;
 }
 
-export default function FileContextMenu({
+export default memo(function FileContextMenu({
   isDark,
   contextMenu,
   onClose,
@@ -104,17 +112,18 @@ export default function FileContextMenu({
                 label: "Nom du fichier avec extension (ex: index.html, style.css, script.py) :",
                 value: "nouveau_fichier.txt",
                 onConfirm: async (val) => {
-                  if (!val.trim()) return;
                   const fileName = val.trim();
+                  if (!fileName) return;
+                  if (!isValidFilenameInput(fileName, isRem)) {
+                    logMessage("Nom de fichier invalide (caractères interdits ou '..').");
+                    return;
+                  }
                   if (isRem) {
-                    const target = activeTab.remotePath.endsWith("/")
-                      ? `${activeTab.remotePath}${fileName}`
-                      : `${activeTab.remotePath}/${fileName}`;
+                    const target = joinRemotePath(activeTab.remotePath, fileName);
                     try {
-                      await invoke("save_remote_file_text", {
+                      await invoke("create_remote_file", {
                         sessionId: activeTab.id,
                         remotePath: target,
-                        content: "",
                       });
                       logMessage(`Fichier distant créé : ${target}`);
                       onNavigateRemote(activeTab.remotePath);
@@ -122,8 +131,7 @@ export default function FileContextMenu({
                       logMessage(`Erreur création fichier distant : ${err}`);
                     }
                   } else {
-                    const cleanPath = currentPath.replace(/[\\/]+$/, "");
-                    const target = `${cleanPath}\\${fileName}`;
+                    const target = joinLocalPath(currentPath, fileName);
                     try {
                       await invoke("create_local_file", { path: target });
                       logMessage(`Fichier local créé : ${target}`);
@@ -150,12 +158,14 @@ export default function FileContextMenu({
                 label: "Nom du dossier :",
                 value: "nouveau_dossier",
                 onConfirm: async (val) => {
-                  if (!val.trim()) return;
                   const dirName = val.trim();
+                  if (!dirName) return;
+                  if (!isValidFilenameInput(dirName, isRem)) {
+                    logMessage("Nom de dossier invalide (caractères interdits ou '..').");
+                    return;
+                  }
                   if (isRem) {
-                    const target = activeTab.remotePath.endsWith("/")
-                      ? `${activeTab.remotePath}${dirName}`
-                      : `${activeTab.remotePath}/${dirName}`;
+                    const target = joinRemotePath(activeTab.remotePath, dirName);
                     try {
                       await invoke("create_remote_dir", {
                         sessionId: activeTab.id,
@@ -167,8 +177,7 @@ export default function FileContextMenu({
                       logMessage(`Erreur création dossier distant : ${err}`);
                     }
                   } else {
-                    const cleanPath = currentPath.replace(/[\\/]+$/, "");
-                    const target = `${cleanPath}\\${dirName}`;
+                    const target = joinLocalPath(currentPath, dirName);
                     try {
                       await invoke("create_local_dir", { path: target });
                       logMessage(`Dossier local créé : ${target}`);
@@ -213,14 +222,16 @@ export default function FileContextMenu({
                 <button
                   onClick={async () => {
                     const entry = contextMenu.entry!;
+                    const sessionId = activeTab.id;
                     onClose();
                     logMessage(`Lecture de "${entry.name}" pour édition...`);
                     try {
                       const res = await invoke<{ content: string; is_lossy: boolean }>("read_remote_file_text", {
-                        sessionId: activeTab.id,
+                        sessionId,
                         remotePath: entry.path,
                       });
                       setEditorModal({
+                        sessionId,
                         path: entry.path,
                         filename: entry.name,
                         content: res.content,
@@ -242,16 +253,29 @@ export default function FileContextMenu({
                 onClick={async () => {
                   const entry = contextMenu.entry!;
                   onClose();
-                  const isExec = /\.(exe|bat|cmd|ps1|vbs|msi|scr|com|reg|sh)$/i.test(entry.name);
-                  const performOpen = async () => {
+                  const isExec = isDangerousExecutable(entry.name);
+                  const performOpen = async (confirmExec: boolean) => {
                     logMessage(`Téléchargement temporaire et ouverture de "${entry.name}"...`);
                     try {
                       const tempPath = await invoke<string>("open_remote_with_system", {
                         sessionId: activeTab.id,
                         remotePath: entry.path,
+                        confirmExecutable: confirmExec,
                       });
                       logMessage(`Fichier ouvert : ${tempPath}`);
                     } catch (err) {
+                      const errStr = String(err);
+                      if (errStr.startsWith("EXECUTABLE_CONFIRM_REQUIRED|") && !confirmExec) {
+                        const safeName = errStr.split("|")[1] || entry.name;
+                        onPromptConfirmModal({
+                          title: "Avertissement de sécurité",
+                          message: `"${safeName}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec le système ?`,
+                          onConfirm: () => {
+                            void performOpen(true);
+                          },
+                        });
+                        return;
+                      }
                       logMessage(`Erreur d'ouverture : ${err}`);
                     }
                   };
@@ -259,11 +283,13 @@ export default function FileContextMenu({
                   if (isExec) {
                     onPromptConfirmModal({
                       title: "Avertissement de sécurité",
-                      message: `"${entry.name}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec Windows ?`,
-                      onConfirm: performOpen,
+                      message: `"${entry.name}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec le système ?`,
+                      onConfirm: () => {
+                        void performOpen(true);
+                      },
                     });
                   } else {
-                    await performOpen();
+                    await performOpen(false);
                   }
                 }}
                 className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-sky-500/20 cursor-pointer"
@@ -377,6 +403,7 @@ export default function FileContextMenu({
                 ? (contextMenu.entry!.permissions & 0o777).toString(8)
                 : "755";
               setChmodModal({
+                sessionId: activeTab.id,
                 path: contextMenu.entry!.path,
                 name: contextMenu.entry!.name,
                 octal: currentOctal,
@@ -398,10 +425,14 @@ export default function FileContextMenu({
                 label: "Nouveau nom :",
                 value: entry.name,
                 onConfirm: async (val) => {
-                  if (!val.trim() || val.trim() === entry.name) return;
                   const newName = val.trim();
+                  if (!newName || newName === entry.name) return;
+                  if (!isValidFilenameInput(newName, true)) {
+                    logMessage("Nom distant invalide (caractères interdits ou '..').");
+                    return;
+                  }
                   const parent = entry.path.split("/").slice(0, -1).join("/") || "/";
-                  const newPath = parent.endsWith("/") ? `${parent}${newName}` : `${parent}/${newName}`;
+                  const newPath = joinRemotePath(parent, newName);
                   try {
                     await invoke("rename_remote", {
                       sessionId: activeTab.id,
@@ -498,9 +529,13 @@ export default function FileContextMenu({
                 label: "Nouveau nom :",
                 value: entry.name,
                 onConfirm: async (val) => {
-                  if (!val.trim() || val.trim() === entry.name) return;
                   const newName = val.trim();
-                  const sep = entry.path.includes("/") ? "/" : "\\";
+                  if (!newName || newName === entry.name) return;
+                  if (!isValidFilenameInput(newName, false)) {
+                    logMessage("Nom local invalide (caractères interdits ou '..').");
+                    return;
+                  }
+                  const sep = entry.path.includes("/") && !entry.path.includes("\\") ? "/" : "\\";
                   const parent = entry.path.split(sep).slice(0, -1).join(sep);
                   const newPath = `${parent}${sep}${newName}`;
                   try {
@@ -588,5 +623,5 @@ export default function FileContextMenu({
       )}
     </div>
   );
-}
+});
 

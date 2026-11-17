@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { X } from "lucide-react";
 import { InputModalState } from "../../types";
 
@@ -8,7 +9,20 @@ interface Props {
 }
 
 export default function InputModal({ inputModal, onClose, isDark = true }: Props) {
+  const [value, setValue] = useState(inputModal?.value ?? "");
+
+  useEffect(() => {
+    if (inputModal) {
+      setValue(inputModal.value);
+    }
+  }, [inputModal]);
+
   if (!inputModal) return null;
+
+  const submit = () => {
+    inputModal.onConfirm(value);
+    onClose();
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in duration-150">
@@ -28,13 +42,12 @@ export default function InputModal({ inputModal, onClose, isDark = true }: Props
           <input
             type="text"
             autoFocus
-            value={inputModal.value}
-            onChange={(e) => {
-              inputModal.value = e.target.value;
-            }}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
-                inputModal.onConfirm((e.target as HTMLInputElement).value);
+                submit();
+              } else if (e.key === "Escape") {
                 onClose();
               }
             }}
@@ -51,11 +64,7 @@ export default function InputModal({ inputModal, onClose, isDark = true }: Props
             Annuler
           </button>
           <button
-            onClick={(e) => {
-              const input = (e.currentTarget.parentElement?.previousElementSibling?.querySelector("input") as HTMLInputElement);
-              inputModal.onConfirm(input?.value || inputModal.value);
-              onClose();
-            }}
+            onClick={submit}
             className="px-3 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
           >
             Valider
@@ -65,4 +74,3 @@ export default function InputModal({ inputModal, onClose, isDark = true }: Props
     </div>
   );
 }
-

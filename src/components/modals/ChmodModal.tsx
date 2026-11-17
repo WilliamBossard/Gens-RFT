@@ -3,6 +3,7 @@ import { ShieldCheck, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface ChmodModalState {
+  sessionId?: string;
   path: string;
   name: string;
   octal: string;
@@ -12,7 +13,7 @@ interface Props {
   chmodModal: ChmodModalState | null;
   onClose: () => void;
   activeTabId: string;
-  onSuccess: () => void;
+  onSuccess: (sessionId: string) => void;
   logMessage: (msg: string) => void;
   isDark?: boolean;
 }
@@ -44,16 +45,17 @@ export default function ChmodModal({
       return;
     }
 
+    const targetSessionId = chmodModal.sessionId || activeTabId;
     setApplying(true);
     try {
       await invoke("chmod_remote", {
-        sessionId: activeTabId,
+        sessionId: targetSessionId,
         path: chmodModal.path,
         permissions: permVal,
       });
       logMessage(`SITE CHMOD ${octal} ${chmodModal.name}`);
       onClose();
-      onSuccess();
+      onSuccess(targetSessionId);
     } catch (err) {
       logMessage(`550 Échec CHMOD : ${err}`);
     } finally {

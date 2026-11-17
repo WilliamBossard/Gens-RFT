@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from "react";
+import React, { useRef, useEffect, useState } from "react";
 import { SlidersHorizontal, Settings, Server, Unplug, ChevronDown } from "lucide-react";
 import { QuickHistoryItem, TabSession } from "../../types";
 
@@ -55,6 +55,7 @@ export default function QuickConnectBar({
   onDisconnect,
 }: Props) {
   const quickHistoryRef = useRef<HTMLDivElement>(null);
+  const [quickProtocol, setQuickProtocol] = useState<"SFTP" | "FTPS" | "FTP">("SFTP");
 
   useEffect(() => {
     if (!showQuickHistoryDropdown) return;
@@ -72,7 +73,7 @@ export default function QuickConnectBar({
   const handleQuickConnect = () => {
     let host = quickHost.trim();
     let port = quickPort.trim();
-    let protocol: "SFTP" | "FTP" | "FTPS" = "SFTP";
+    let protocol: "SFTP" | "FTP" | "FTPS" = quickProtocol;
 
     if (host.toLowerCase().startsWith("ftps://")) {
       protocol = "FTPS";
@@ -86,10 +87,6 @@ export default function QuickConnectBar({
       protocol = "SFTP";
       host = host.substring(7);
       if (!port || port === "21") port = "22";
-    } else if (port === "21") {
-      protocol = "FTP";
-    } else if (port === "990") {
-      protocol = "FTPS";
     }
 
     // Support [ipv6]:port ou host:port (en préservant les adresses IPv6 brutes)
@@ -155,6 +152,33 @@ export default function QuickConnectBar({
           isDark ? "border-neutral-800 bg-neutral-950 text-neutral-200" : "border-neutral-300 bg-neutral-50 text-neutral-800"
         }`}
       >
+        <select
+          value={quickProtocol}
+          onChange={(e) => {
+            const p = e.target.value as "SFTP" | "FTPS" | "FTP";
+            setQuickProtocol(p);
+            if (p === "SFTP" && quickPort === "21") setQuickPort("22");
+            else if ((p === "FTP" || p === "FTPS") && quickPort === "22") setQuickPort("21");
+          }}
+          className={`bg-transparent px-2 py-1 text-[11px] font-semibold focus:outline-none border-r border-neutral-700/50 cursor-pointer shrink-0 ${
+            quickProtocol === "FTP"
+              ? "text-amber-400"
+              : quickProtocol === "FTPS"
+              ? "text-emerald-400"
+              : "text-sky-400"
+          }`}
+          title={
+            quickProtocol === "FTP"
+              ? "FTP (non chiffré — identifiants en clair)"
+              : quickProtocol === "FTPS"
+              ? "FTPS (FTP sur TLS)"
+              : "SFTP (SSH File Transfer)"
+          }
+        >
+          <option value="SFTP" className="bg-neutral-900 text-neutral-200">SFTP</option>
+          <option value="FTPS" className="bg-neutral-900 text-neutral-200">FTPS</option>
+          <option value="FTP" className="bg-neutral-900 text-amber-400">FTP</option>
+        </select>
         <input
           type="text"
           placeholder="Hôte"
@@ -256,6 +280,7 @@ export default function QuickConnectBar({
                     <div
                       key={idx}
                       onClick={() => {
+                        setQuickProtocol(item.protocol);
                         setQuickHost(item.host);
                         setQuickPort(item.port);
                         setQuickUser(item.username);

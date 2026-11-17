@@ -1,5 +1,6 @@
-import React, { useRef } from "react";
+import React, { useRef, useMemo, useEffect, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   HardDrive,
   Monitor,
@@ -17,7 +18,7 @@ import {
 } from "lucide-react";
 import DirectoryTree from "../../DirectoryTree";
 import { FileEntry, SortField, SortOrder, TabSession } from "../../types";
-import { getFileBadge, formatFileSize } from "../../utils/fileHelpers";
+import { getFileBadge, formatFileSize, isValidFilenameInput, joinLocalPath } from "../../utils/fileHelpers";
 
 interface Props {
   isDark: boolean;
@@ -73,7 +74,7 @@ interface Props {
   logMessage: (msg: string) => void;
 }
 
-export default function LocalPane({
+function LocalPaneComponent({
   isDark,
   localPaneWidth,
   currentPath,
@@ -115,6 +116,26 @@ export default function LocalPane({
   logMessage,
 }: Props) {
   const lastSelectedLocalIndexRef = useRef<number | null>(null);
+  const listParentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    lastSelectedLocalIndexRef.current = null;
+  }, [currentPath]);
+
+  const localSubFolders = useMemo(
+    () =>
+      files
+        .filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith(".")))
+        .map((f) => f.name),
+    [files, showHidden]
+  );
+
+  const rowVirtualizer = useVirtualizer({
+    count: processedLocalFiles.length,
+    getScrollElement: () => listParentRef.current,
+    estimateSize: () => 30,
+    overscan: 12,
+  });
 
   return (
     <section
@@ -304,14 +325,21 @@ export default function LocalPane({
           </div>
           <button
             onClick={() => {
-              const parts = currentPath.split(/[\\/]+/).filter(Boolean);
-              parts.pop();
-              const isWinDrive = parts.length === 1 && parts[0].endsWith(":");
-              let parentPath = parts.join("\\");
-              if (isWinDrive) {
-                parentPath += "\\";
+              const isPosix = currentPath.startsWith("/");
+              if (isPosix) {
+                const parts = currentPath.split("/").filter(Boolean);
+                parts.pop();
+                onNavigateLocal("/" + parts.join("/"));
+              } else {
+                const parts = currentPath.split(/[\\/]+/).filter(Boolean);
+                parts.pop();
+                const isWinDrive = parts.length === 1 && parts[0].endsWith(":");
+                let parentPath = parts.join("\\");
+                if (isWinDrive) {
+                  parentPath += "\\";
+                }
+                onNavigateLocal(parentPath || (drives[0] || "C:\\"));
               }
-              onNavigateLocal(parentPath || (drives[0] || "C:\\"));
             }}
             className="rounded p-1 hover:bg-neutral-500/20 cursor-pointer transition active:scale-95"
             title="Dossier parent"
@@ -327,8 +355,11 @@ export default function LocalPane({
                 onConfirm: async (val) => {
                   const dirName = val.trim();
                   if (!dirName) return;
-                  const cleanPath = currentPath.replace(/[\\/]+$/, "");
-                  const target = `${cleanPath}\\${dirName}`;
+                  if (!isValidFilenameInput(dirName, false)) {
+                    logMessage("Nom de dossier local invalide (caractères interdits ou '..').");
+                    return;
+                  }
+                  const target = joinLocalPath(currentPath, dirName);
                   try {
                     await invoke("create_local_dir", { path: target });
                     logMessage(`Dossier local créé : ${target}`);
@@ -359,8 +390,8 @@ export default function LocalPane({
             <DirectoryTree
               isDark={isDark}
               isRemote={false}
-              currentPath={currentPath || (drives[0] || "C:\\")}
-              subFolders={files.filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith("."))).map((f) => f.name)}
+              currentPath={currentPath}
+              subFolders={localSubFolders}
               onNavigate={onNavigateLocal}
             />
           </div>
@@ -418,8 +449,9 @@ export default function LocalPane({
         <span className="col-span-1 text-center">Action</span>
       </div>
 
-      {/* Liste des fichiers locaux */}
+      {/* Liste des fichiers locaux virtualisée */}
       <div
+        ref={listParentRef}
         onClick={() => {
           setActivePane("local");
           setSelectedLocalPaths(new Set());
@@ -429,108 +461,128 @@ export default function LocalPane({
           setActivePane("local");
           onOpenContextMenu(e, null, false);
         }}
-        className="flex-1 overflow-y-auto font-mono text-xs divide-y divide-neutral-500/10 min-h-[100px]"
+        className="flex-1 overflow-y-auto font-mono text-xs min-h-[100px]"
       >
-        {processedLocalFiles.map((item, index) => {
-          const badge = getFileBadge(item.name, isDark);
-          const isSelected = selectedLocalPaths.has(item.path);
-          return (
-            <div
-              key={item.path}
-              draggable
-              onClick={(e) => {
-                e.stopPropagation();
-                setActivePane("local");
-                if (e.shiftKey && lastSelectedLocalIndexRef.current !== null) {
-                  const start = Math.min(lastSelectedLocalIndexRef.current, index);
-                  const end = Math.max(lastSelectedLocalIndexRef.current, index);
-                  const rangePaths = processedLocalFiles.slice(start, end + 1).map((f) => f.path);
-                  setSelectedLocalPaths(new Set(rangePaths));
-                } else if (e.ctrlKey || e.metaKey) {
-                  lastSelectedLocalIndexRef.current = index;
-                  setSelectedLocalPaths((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(item.path)) next.delete(item.path);
-                    else next.add(item.path);
-                    return next;
-                  });
-                } else {
-                  lastSelectedLocalIndexRef.current = index;
-                  setSelectedLocalPaths(new Set([item.path]));
-                }
-              }}
-              onDragStart={(e) => {
-                setDraggedItem({ entry: item, from: "local" });
-                e.dataTransfer.setData("text/plain", item.path);
-                e.dataTransfer.effectAllowed = "copyMove";
-              }}
-              onDragEnd={() => {
-                setDraggedItem(null);
-                setIsOverRemote(false);
-                setIsOverLocal(false);
-                setDragOverTabId(null);
-              }}
-              onDoubleClick={() => {
-                if (item.is_dir) {
-                  onNavigateLocal(item.path);
-                } else {
-                  if (!activeTab.isConnected) {
-                    logMessage("Info : Connectez-vous d'abord à un serveur distant pour transférer.");
-                    return;
+        <div
+          style={{
+            height: `${rowVirtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
+        >
+          {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+            const index = virtualRow.index;
+            const item = processedLocalFiles[index];
+            const badge = getFileBadge(item.name, isDark);
+            const isSelected = selectedLocalPaths.has(item.path);
+            return (
+              <div
+                key={item.path}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  height: `${virtualRow.size}px`,
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+                draggable
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setActivePane("local");
+                  if (e.shiftKey && lastSelectedLocalIndexRef.current !== null) {
+                    const start = Math.min(lastSelectedLocalIndexRef.current, index);
+                    const end = Math.max(lastSelectedLocalIndexRef.current, index);
+                    const rangePaths = processedLocalFiles.slice(start, end + 1).map((f) => f.path);
+                    setSelectedLocalPaths(new Set(rangePaths));
+                  } else if (e.ctrlKey || e.metaKey) {
+                    lastSelectedLocalIndexRef.current = index;
+                    setSelectedLocalPaths((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(item.path)) next.delete(item.path);
+                      else next.add(item.path);
+                      return next;
+                    });
+                  } else {
+                    lastSelectedLocalIndexRef.current = index;
+                    setSelectedLocalPaths(new Set([item.path]));
                   }
-                  onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
-                }
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setActivePane("local");
-                if (!selectedLocalPaths.has(item.path)) {
-                  setSelectedLocalPaths(new Set([item.path]));
-                }
-                onOpenContextMenu(e, item, false);
-              }}
-              className={`grid grid-cols-12 items-center px-3 py-1.5 cursor-pointer group transition duration-75 border-l-2 select-none ${
-                isSelected
-                  ? isDark
-                    ? "bg-sky-500/20 border-sky-400 font-medium"
-                    : "bg-sky-100 border-sky-600 font-medium"
-                  : "border-transparent hover:bg-sky-500/10"
-              }`}
-            >
-              <div className="col-span-8 flex items-center gap-2 truncate pr-2">
-                {item.is_dir ? (
-                  <Folder className="h-4 w-4 text-amber-500 shrink-0" />
-                ) : (
-                  badge.icon
-                )}
-                <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
-                  {item.name}
-                </span>
-              </div>
+                }}
+                onDragStart={(e) => {
+                  setDraggedItem({ entry: item, from: "local" });
+                  e.dataTransfer.setData("text/plain", item.path);
+                  e.dataTransfer.effectAllowed = "copyMove";
+                }}
+                onDragEnd={() => {
+                  setDraggedItem(null);
+                  setIsOverRemote(false);
+                  setIsOverLocal(false);
+                  setDragOverTabId(null);
+                }}
+                onDoubleClick={() => {
+                  if (item.is_dir) {
+                    onNavigateLocal(item.path);
+                  } else {
+                    if (!activeTab.isConnected) {
+                      logMessage("Info : Connectez-vous d'abord à un serveur distant pour transférer.");
+                      return;
+                    }
+                    onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
+                  }
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setActivePane("local");
+                  if (!selectedLocalPaths.has(item.path)) {
+                    setSelectedLocalPaths(new Set([item.path]));
+                  }
+                  onOpenContextMenu(e, item, false);
+                }}
+                className={`grid grid-cols-12 items-center px-3 py-1.5 border-b border-neutral-500/10 cursor-pointer group transition duration-75 border-l-2 select-none ${
+                  isSelected
+                    ? isDark
+                      ? "bg-sky-500/20 border-l-sky-400 font-medium"
+                      : "bg-sky-100 border-l-sky-600 font-medium"
+                    : "border-l-transparent hover:bg-sky-500/10"
+                }`}
+              >
+                <div className="col-span-8 flex items-center gap-2 truncate pr-2">
+                  {item.is_dir ? (
+                    <Folder className="h-4 w-4 text-amber-500 shrink-0" />
+                  ) : (
+                    badge.icon
+                  )}
+                  <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
+                    {item.name}
+                  </span>
+                </div>
 
-              <div className="col-span-3 text-right text-[11px] text-neutral-500 font-sans">
-                {!item.is_dir ? formatFileSize(item.size) : "--"}
-              </div>
+                <div className="col-span-3 text-right text-[11px] text-neutral-500 font-sans">
+                  {!item.is_dir ? formatFileSize(item.size) : "--"}
+                </div>
 
-              <div className="col-span-1 flex justify-center">
-                {activeTab.isConnected && !item.is_dir && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
-                    }}
-                    className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-sky-500 cursor-pointer transition active:scale-95"
-                    title="Envoyer vers le serveur"
-                  >
-                    <Upload className="h-3.5 w-3.5" />
-                  </button>
-                )}
+                <div className="col-span-1 flex justify-center">
+                  {activeTab.isConnected && !item.is_dir && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-sky-500 cursor-pointer transition active:scale-95"
+                      title="Envoyer vers le serveur"
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
       </div>
     </section>
   );
 }
+
+export default memo(LocalPaneComponent);

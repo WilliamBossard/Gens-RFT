@@ -1,9 +1,14 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState, memo, lazy, Suspense } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { ListOrdered, Terminal as TerminalIcon, RotateCcw, Ban, ChevronDown, ChevronUp } from "lucide-react";
-import SshTerminal from "../../SshTerminal";
 import QueuePanel from "../QueuePanel";
 import { TabSession } from "../../types";
 import { useTransferStore } from "../../store/useTransferStore";
+import { useLogStore } from "../../store/useLogStore";
+
+const SshTerminal = lazy(() => import("../../SshTerminal"));
+
+export type TerminalTabInfo = Pick<TabSession, "id" | "title" | "isConnected" | "protocol">;
 
 interface Props {
   isDark: boolean;
@@ -14,11 +19,59 @@ interface Props {
   activeBottomTab: "logs" | "queue" | "terminal";
   setActiveBottomTab: (tab: "logs" | "queue" | "terminal") => void;
   enableSshTerminal: boolean;
-  activeTab: TabSession;
-  logs: string[];
+  tabs: TerminalTabInfo[];
+  activeTab: TerminalTabInfo;
 }
 
-export default function BottomPanel({
+const LogsViewer = memo(function LogsViewer({ bottomOpen }: { bottomOpen: boolean }) {
+  const logs = useLogStore((state) => state.logs);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
+
+  const rowVirtualizer = useVirtualizer({
+    count: logs.length,
+    getScrollElement: () => logsContainerRef.current,
+    estimateSize: () => 20,
+    overscan: 12,
+  });
+
+  useEffect(() => {
+    if (bottomOpen && logs.length > 0) {
+      rowVirtualizer.scrollToIndex(logs.length - 1, { align: "end" });
+    }
+  }, [logs.length, bottomOpen, rowVirtualizer]);
+
+  return (
+    <div ref={logsContainerRef} className="flex-1 overflow-y-auto p-2.5 font-mono text-[11px]">
+      <div
+        style={{
+          height: `${rowVirtualizer.getTotalSize()}px`,
+          width: "100%",
+          position: "relative",
+        }}
+      >
+        {rowVirtualizer.getVirtualItems().map((virtualRow) => (
+          <div
+            key={virtualRow.index}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: `${virtualRow.size}px`,
+              transform: `translateY(${virtualRow.start}px)`,
+            }}
+            className="flex gap-2 items-center truncate"
+          >
+            <span className="text-neutral-500 shrink-0">&gt;</span>
+            <span className="truncate">{logs[virtualRow.index]}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function BottomPanelComponent({
   isDark,
   bottomHeight,
   setBottomHeight,
@@ -27,25 +80,51 @@ export default function BottomPanel({
   activeBottomTab,
   setActiveBottomTab,
   enableSshTerminal,
+  tabs,
   activeTab,
-  logs,
 }: Props) {
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  const [activatedTerminalTabs, setActivatedTerminalTabs] = useState<Record<string, boolean>>({});
 
-  const queue = useTransferStore((state) => state.queue);
+  const runningOrQueuedCount = useTransferStore(
+    (state) => state.queue.filter((q) => q.status === "queued" || q.status === "running").length
+  );
   const clearDone = useTransferStore((state) => state.clearDone);
   const cancelAll = useTransferStore((state) => state.cancelAll);
   const retryAllFailed = useTransferStore((state) => state.retryAllFailed);
 
-  const runningOrQueuedCount = queue.filter(
-    (q) => q.status === "queued" || q.status === "running"
-  ).length;
-
+  // Activer paresseusement le terminal SSH uniquement quand l'utilisateur sélectionne l'onglet Terminal
   useEffect(() => {
-    if (activeBottomTab === "logs" && bottomOpen) {
-      logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (
+      enableSshTerminal &&
+      bottomOpen &&
+      activeBottomTab === "terminal" &&
+      activeTab.isConnected &&
+      activeTab.protocol === "SFTP"
+    ) {
+      setActivatedTerminalTabs((prev) =>
+        prev[activeTab.id] ? prev : { ...prev, [activeTab.id]: true }
+      );
     }
-  }, [logs, activeBottomTab, bottomOpen]);
+  }, [enableSshTerminal, bottomOpen, activeBottomTab, activeTab.id, activeTab.isConnected, activeTab.protocol]);
+
+  // Nettoyer l'état d'activation quand une session est déconnectée ou fermée
+  useEffect(() => {
+    setActivatedTerminalTabs((prev) => {
+      const connectedIds = new Set(
+        tabs.filter((t) => t.isConnected && t.protocol === "SFTP").map((t) => t.id)
+      );
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [id, active] of Object.entries(prev)) {
+        if (active && connectedIds.has(id)) {
+          next[id] = true;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [tabs]);
 
   return (
     <>
@@ -71,7 +150,7 @@ export default function BottomPanel({
       {/* Console inférieure */}
       <footer
         style={{ height: bottomOpen ? `${bottomHeight}px` : "32px" }}
-        className={`border-t flex flex-col transition-all duration-150 ${
+        className={`border-t flex flex-col ${
           isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-neutral-100 text-neutral-800"
         }`}
       >
@@ -163,27 +242,33 @@ export default function BottomPanel({
 
         {bottomOpen && (
           <div className="flex-1 flex flex-col overflow-hidden relative">
-            {enableSshTerminal && (
-              <div className={`h-full w-full ${activeBottomTab === "terminal" ? "block" : "hidden"}`}>
-                <SshTerminal
-                  sessionId={activeTab.id}
-                  isConnected={activeTab.isConnected}
-                  protocol={activeTab.protocol}
-                />
-              </div>
-            )}
-
-            {activeBottomTab === "logs" && (
-              <div className="flex-1 overflow-y-auto p-2.5 font-mono text-[11px] space-y-1">
-                {logs.map((log, idx) => (
-                  <div key={idx} className="flex gap-2">
-                    <span className="text-neutral-500">&gt;</span>
-                    <span>{log}</span>
+            {enableSshTerminal &&
+              tabs.map((tab) => {
+                const isTabVisible = activeBottomTab === "terminal" && tab.id === activeTab.id;
+                const shouldMount =
+                  isTabVisible || (tab.isConnected && tab.protocol === "SFTP" && !!activatedTerminalTabs[tab.id]);
+                if (!shouldMount) return null;
+                return (
+                  <div key={tab.id} className={`h-full w-full ${isTabVisible ? "block" : "hidden"}`}>
+                    <Suspense
+                      fallback={
+                        <div className="flex h-full items-center justify-center text-xs text-neutral-500">
+                          Chargement du terminal SSH...
+                        </div>
+                      }
+                    >
+                      <SshTerminal
+                        sessionId={tab.id}
+                        isConnected={tab.isConnected}
+                        isVisible={isTabVisible}
+                        protocol={tab.protocol}
+                      />
+                    </Suspense>
                   </div>
-                ))}
-                <div ref={logsEndRef} />
-              </div>
-            )}
+                );
+              })}
+
+            {activeBottomTab === "logs" && <LogsViewer bottomOpen={bottomOpen} />}
 
             {activeBottomTab === "queue" && <QueuePanel />}
           </div>
@@ -192,3 +277,5 @@ export default function BottomPanel({
     </>
   );
 }
+
+export default memo(BottomPanelComponent);

@@ -1,231 +1,220 @@
-use async_trait::async_trait;
+mod ftp;
+mod local;
+mod models;
+mod sftp;
+mod security;
+mod state;
+
 use russh::{ChannelMsg, client};
 use russh_sftp::client::SftpSession;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use suppaftp::native_tls::TlsConnector;
-use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
-use tauri::{AppHandle, Emitter, State};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc};
-use walkdir::WalkDir;
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use zeroize::Zeroizing;
 
-#[derive(Serialize, Clone, Debug)]
-pub struct FileEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub permissions: Option<u32>,
+use models::{FileEntry, HostKeyRejectReason, PtyCommand, RemoteTextFile};
+use security::{
+    ClientHandler, is_dangerous_executable_filename, is_valid_id, is_valid_remote_filename,
+    is_valid_remote_path, remote_file_name, sanitize_windows_filename, shell_escape,
+    validate_ftp_arg,
+};
+use state::{AppState, FtpSessionConfig, ServerSession};
+use suppaftp::NativeTlsFtpStream;
+
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const PTY_BATCH_THRESHOLD: usize = 16 * 1024;
+const PTY_BATCH_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_PREVIEW_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_FTP_POOL_SIZE: usize = 2;
+
+fn ensure_valid_id(id: &str, label: &str) -> Result<(), String> {
+    if !is_valid_id(id) {
+        return Err(format!("Identifiant {} invalide", label));
+    }
+    Ok(())
 }
 
-#[derive(Serialize, Clone, Debug)]
-pub struct TransferProgress {
-    pub transfer_id: String,
-    pub filename: String,
-    pub transferred: u64,
-    pub total: u64,
-    pub percent: f32,
-    pub direction: String,
-}
+fn flush_pty_utf8(app: &AppHandle, event_name: &str, pending: &mut Vec<u8>, force_all: bool) {
+    if pending.is_empty() {
+        return;
+    }
 
-#[derive(Serialize, Clone, Debug)]
-pub struct RemoteTextFile {
-    pub content: String,
-    pub is_lossy: bool,
-}
+    let mut out = String::new();
+    let mut consumed = 0usize;
 
-pub enum PtyCommand {
-    Input(Vec<u8>),
-    Resize { cols: u32, rows: u32 },
-}
-
-#[derive(Clone)]
-pub struct ClientHandler {
-    pub host: String,
-    pub port: u16,
-}
-
-#[async_trait]
-impl client::Handler for ClientHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &russh::keys::key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        match russh_keys::check_known_hosts(&self.host, self.port, server_public_key) {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                // Nouvelle clé pour cet hôte : on l'apprend automatiquement dans ~/.ssh/known_hosts
-                let _ = russh_keys::learn_known_hosts(&self.host, self.port, server_public_key);
-                Ok(true)
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(valid) => {
+                out.push_str(valid);
+                consumed = pending.len();
+                break;
             }
-            Err(russh_keys::Error::KeyChanged { .. }) => {
-                // Clé modifiée suspecte (possible attaque Man-in-the-Middle) !
-                eprintln!("ATTENTION: La clé d'hôte du serveur a changé pour {}:{}", self.host, self.port);
-                Ok(false)
-            }
-            Err(_) => {
-                let _ = russh_keys::learn_known_hosts(&self.host, self.port, server_public_key);
-                Ok(true)
-            }
-        }
-    }
-}
-
-pub struct ServerSession {
-    pub ssh_session: Option<Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>>,
-    pub pty_sender: Option<mpsc::Sender<PtyCommand>>,
-    pub sftp: Option<Arc<SftpSession>>,
-    pub ftp: Option<Arc<tokio::sync::Mutex<NativeTlsFtpStream>>>,
-    pub protocol: String,
-    pub current_remote_path: String,
-}
-
-pub struct AppState {
-    pub sessions: Arc<Mutex<HashMap<String, ServerSession>>>,
-    pub cancel_tokens: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-}
-
-impl AppState {
-    pub async fn get_or_create_cancel_token(&self, id: &str) -> Arc<AtomicBool> {
-        let mut tokens = self.cancel_tokens.lock().await;
-        tokens
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
-    }
-
-    pub async fn cancel_transfer(&self, id: &str) {
-        let tokens = self.cancel_tokens.lock().await;
-        if let Some(token) = tokens.get(id) {
-            token.store(true, Ordering::Relaxed);
-        }
-    }
-
-    pub async fn cancel_all(&self) {
-        let tokens = self.cancel_tokens.lock().await;
-        for token in tokens.values() {
-            token.store(true, Ordering::Relaxed);
-        }
-    }
-
-    pub async fn cleanup_cancel_token(&self, id: &str) {
-        let mut tokens = self.cancel_tokens.lock().await;
-        tokens.remove(id);
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn GetLogicalDrives() -> u32;
-}
-
-#[tauri::command]
-fn get_windows_drives() -> Vec<String> {
-    let mut drives = Vec::new();
-    #[cfg(windows)]
-    {
-        let mask = unsafe { GetLogicalDrives() };
-        for i in 0..26 {
-            if (mask & (1 << i)) != 0 {
-                let letter = (b'A' + i) as char;
-                drives.push(format!("{}:\\", letter));
-            }
-        }
-    }
-    if drives.is_empty() {
-        drives.push("C:\\".to_string());
-    }
-    drives
-}
-
-#[tauri::command]
-fn get_system_folders() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let base = PathBuf::from(userprofile);
-        let desktop = base.join("Desktop");
-        let downloads = base.join("Downloads");
-        let documents = base.join("Documents");
-
-        if desktop.exists() {
-            map.insert("desktop".into(), desktop.to_string_lossy().to_string());
-        }
-        if downloads.exists() {
-            map.insert("downloads".into(), downloads.to_string_lossy().to_string());
-        }
-        if documents.exists() {
-            map.insert("documents".into(), documents.to_string_lossy().to_string());
-        }
-        map.insert("home".into(), base.to_string_lossy().to_string());
-    }
-    map
-}
-
-#[tauri::command]
-fn read_local_dir(path: Option<String>) -> Result<Vec<FileEntry>, String> {
-    let target_path = match path {
-        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => dirs_next()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-    };
-
-    let read_dir = fs::read_dir(&target_path).map_err(|e| e.to_string())?;
-    let mut entries = Vec::new();
-
-    for entry in read_dir.flatten() {
-        let metadata = entry.metadata().ok();
-        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-        let name = entry.file_name().to_string_lossy().to_string();
-        let full_path = entry.path().to_string_lossy().to_string();
-
-        entries.push(FileEntry {
-            name,
-            path: full_path,
-            is_dir,
-            size,
-            permissions: None,
-        });
-    }
-
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-
-    Ok(entries)
-}
-
-#[tauri::command]
-fn read_local_subdirs(path: String) -> Result<Vec<String>, String> {
-    let p = Path::new(&path);
-    if !p.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(p) {
-        for entry in entries.flatten() {
-            if let Ok(m) = entry.metadata() {
-                if m.is_dir() {
-                    dirs.push(entry.file_name().to_string_lossy().to_string());
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    // Safety: valid_up_to() guarantees valid UTF-8 slice
+                    let valid_str = std::str::from_utf8(&pending[consumed..consumed + valid_len])
+                        .unwrap_or_default();
+                    out.push_str(valid_str);
+                    consumed += valid_len;
+                }
+                match err.error_len() {
+                    Some(bad_len) => {
+                        out.push('\u{FFFD}');
+                        consumed += bad_len;
+                    }
+                    None => {
+                        if force_all {
+                            out.push('\u{FFFD}');
+                            consumed = pending.len();
+                        }
+                        break;
+                    }
                 }
             }
         }
     }
-    dirs.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    Ok(dirs)
+
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+
+    if !out.is_empty() {
+        let _ = app.emit(event_name, out);
+    }
 }
 
+async fn stop_pty_gracefully(
+    pty_sender: Option<mpsc::Sender<PtyCommand>>,
+    pty_task: Option<tokio::task::JoinHandle<()>>,
+) {
+    drop(pty_sender);
+    if let Some(mut task) = pty_task
+        && tokio::time::timeout(Duration::from_millis(300), &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+    }
+}
+
+async fn cleanup_session_resources(mut sess: ServerSession) {
+    stop_pty_gracefully(sess.pty_sender.take(), sess.pty_task.take()).await;
+    sess.ftp_config.take();
+    if let Some(pool_arc) = sess.ftp_pool.take() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut pool) = pool_arc.lock() {
+                    for mut conn in pool.drain(..) {
+                        let _ = conn.quit();
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+    if let Some(ftp_arc) = sess.ftp.take() {
+        // Ne pas bloquer disconnect_server si un transfert ou verrou FTP est encore actif
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut ftp) = ftp_arc.try_lock() {
+                    let _ = ftp.quit();
+                }
+            }),
+        )
+        .await;
+    }
+    if let Some(ssh_arc) = sess.ssh_session.take()
+        && let Ok(ssh) = tokio::time::timeout(Duration::from_secs(2), ssh_arc.lock()).await
+    {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            ssh.disconnect(russh::Disconnect::ByApplication, "", "en"),
+        )
+        .await;
+    }
+}
+
+fn is_ftp_connection_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("connection")
+        || lower.contains("broken pipe")
+        || lower.contains("reset")
+        || lower.contains("eof")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("421")
+        || lower.contains("closed")
+}
+
+fn run_ftp_browsing<T, F>(
+    ftp_arc: &Arc<std::sync::Mutex<NativeTlsFtpStream>>,
+    ftp_cfg: &Option<FtpSessionConfig>,
+    mut op: F,
+) -> Result<T, String>
+where
+    F: FnMut(&mut NativeTlsFtpStream) -> Result<T, String>,
+{
+    let mut ftp_guard = ftp_arc
+        .lock()
+        .map_err(|_| "Verrou FTP corrompu".to_string())?;
+    match op(&mut ftp_guard) {
+        Ok(val) => Ok(val),
+        Err(first_err) => {
+            let dead = is_ftp_connection_error(&first_err) || ftp_guard.noop().is_err();
+            if dead
+                && let Some(cfg) = ftp_cfg
+                && let Ok(new_stream) = ftp::connect_from_config(cfg)
+            {
+                *ftp_guard = new_stream;
+                return op(&mut ftp_guard);
+            }
+            Err(first_err)
+        }
+    }
+}
+
+fn acquire_ftp_transfer_conn(
+    pool_arc: &Option<Arc<std::sync::Mutex<Vec<NativeTlsFtpStream>>>>,
+    cfg: &FtpSessionConfig,
+) -> Result<NativeTlsFtpStream, String> {
+    if let Some(pool) = pool_arc
+        && let Ok(mut guard) = pool.lock()
+    {
+        while let Some(mut conn) = guard.pop() {
+            if conn.noop().is_ok() {
+                return Ok(conn);
+            }
+        }
+    }
+    ftp::connect_from_config(cfg)
+}
+
+fn release_ftp_transfer_conn(
+    pool_arc: &Option<Arc<std::sync::Mutex<Vec<NativeTlsFtpStream>>>>,
+    mut conn: NativeTlsFtpStream,
+    reusable: bool,
+) {
+    if reusable
+        && let Some(pool) = pool_arc
+        && let Ok(mut guard) = pool.lock()
+        && guard.len() < MAX_FTP_POOL_SIZE
+    {
+        guard.push(conn);
+        return;
+    }
+    let _ = conn.quit();
+}
+
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn connect_server(
     session_id: String,
@@ -237,30 +226,56 @@ async fn connect_server(
     password: Option<String>,
     key_path: Option<String>,
     passphrase: Option<String>,
+    trust_host_key: Option<bool>,
+    accept_invalid_certs: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    ensure_valid_id(&session_id, "de session")?;
+    if host.trim().is_empty() {
+        return Err("L'adresse de l'hôte est requise".to_string());
+    }
+    if port == 0 {
+        return Err("Numéro de port invalide".to_string());
+    }
+
+    // Fermer une éventuelle session existante sur ce même ID avant de la remplacer
+    let previous = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&session_id)
+    };
+    if let Some(old_sess) = previous {
+        state.cancel_session_transfers(&session_id).await;
+        cleanup_session_resources(old_sess).await;
+    }
+
     if protocol == "FTP" || protocol == "FTPS" {
-        let addr = format!("{}:{}", host, port);
-        let pass = password.unwrap_or_default();
+        let prot_c = protocol.clone();
+        let host_c = host.clone();
+        let user_c = username.clone();
+        let pass_z = Zeroizing::new(password.unwrap_or_default());
+        let allow_invalid = accept_invalid_certs.unwrap_or(false);
 
-        let mut ftp = if protocol == "FTPS" {
-            let connector = TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(|e| format!("Erreur configuration TLS: {}", e))?;
-            let tls_connector = NativeTlsConnector::from(connector);
-
-            let stream = NativeTlsFtpStream::connect(&addr)
-                .map_err(|e| format!("Erreur TCP FTPS: {}", e))?;
-            stream
-                .into_secure(tls_connector, &host)
-                .map_err(|e| format!("Échec négociation TLS (FTPS): {}", e))?
-        } else {
-            NativeTlsFtpStream::connect(&addr).map_err(|e| format!("Erreur TCP FTP: {}", e))?
+        let ftp_cfg = FtpSessionConfig {
+            protocol: prot_c.clone(),
+            host: host_c.clone(),
+            port,
+            username: user_c.clone(),
+            password: pass_z.clone(),
+            accept_invalid_certs: allow_invalid,
         };
 
-        ftp.login(&username, &pass)
-            .map_err(|e| format!("Auth {} rejetée: {}", protocol, e))?;
+        let ftp = tokio::task::spawn_blocking(move || {
+            ftp::connect_ftp_blocking(
+                &prot_c,
+                &host_c,
+                port,
+                &user_c,
+                &pass_z,
+                allow_invalid,
+            )
+        })
+        .await
+        .map_err(|e| format!("Erreur tâche FTP: {}", e))??;
 
         let mut sessions = state.sessions.lock().await;
         sessions.insert(
@@ -268,45 +283,94 @@ async fn connect_server(
             ServerSession {
                 ssh_session: None,
                 pty_sender: None,
+                pty_task: None,
                 sftp: None,
-                ftp: Some(Arc::new(tokio::sync::Mutex::new(ftp))),
+                sftp_semaphore: None,
+                ftp: Some(Arc::new(std::sync::Mutex::new(ftp))),
+                ftp_pool: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+                ftp_config: Some(ftp_cfg),
                 protocol: protocol.clone(),
                 current_remote_path: "/".into(),
             },
         );
 
-        return Ok(format!("Connecté en {} à {}@{}:{}", protocol, username, host, port));
+        return Ok(format!(
+            "Connecté en {} à {}@{}:{}",
+            protocol, username, host, port
+        ));
     }
 
-    let mut config = client::Config::default();
-    config.window_size = 4 * 1024 * 1024;
-    config.maximum_packet_size = 64 * 1024;
-    let config = Arc::new(config);
+    let config = Arc::new(client::Config {
+        window_size: 4 * 1024 * 1024,
+        maximum_packet_size: 64 * 1024,
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
+
+    let reject_reason = Arc::new(Mutex::new(None));
     let handler = ClientHandler {
         host: host.clone(),
         port,
+        trust_host_key: trust_host_key.unwrap_or(false),
+        reject_reason: Arc::clone(&reject_reason),
     };
-    let mut session = client::connect(config, (host.as_str(), port), handler)
-        .await
-        .map_err(|e| format!("Erreur réseau SSH: {}", e))?;
+
+    let connect_res = tokio::time::timeout(
+        SSH_CONNECT_TIMEOUT,
+        client::connect(config, (host.as_str(), port), handler),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timeout connexion SSH vers {}:{} ({}s)",
+            host,
+            port,
+            SSH_CONNECT_TIMEOUT.as_secs()
+        )
+    })?;
+
+    let mut session = match connect_res {
+        Ok(s) => s,
+        Err(e) => {
+            let reason = reject_reason.lock().await.take();
+            match reason {
+                Some(HostKeyRejectReason::Unknown { algo, fingerprint }) => {
+                    return Err(format!("HOST_KEY_UNKNOWN|{}|{}", algo, fingerprint));
+                }
+                Some(HostKeyRejectReason::Changed { algo, fingerprint }) => {
+                    return Err(format!("HOST_KEY_CHANGED|{}|{}", algo, fingerprint));
+                }
+                Some(HostKeyRejectReason::Error(msg)) => return Err(msg),
+                None => return Err(format!("Erreur réseau SSH: {}", e)),
+            }
+        }
+    };
 
     let authenticated = if auth_type == "key" {
         let path = key_path.ok_or_else(|| "Chemin de clé SSH manquant".to_string())?;
-        let key_data = russh_keys::load_secret_key(path, passphrase.as_deref())
-            .map_err(|e| format!("Clé SSH invalide ou passphrase erronée: {}", e))?;
+        let passphrase_buf = passphrase.map(Zeroizing::new);
+        let key_res = russh_keys::load_secret_key(path, passphrase_buf.as_deref().map(|s| s.as_str()));
+        let key_data =
+            key_res.map_err(|e| format!("Clé SSH invalide ou passphrase erronée: {}", e))?;
         session
             .authenticate_publickey(username.clone(), Arc::new(key_data))
             .await
             .map_err(|e| format!("Auth clé rejetée: {}", e))?
     } else {
-        let pass = password.unwrap_or_default();
+        let pass = Zeroizing::new(password.unwrap_or_default());
         session
-            .authenticate_password(username.clone(), pass)
+            .authenticate_password(username.clone(), pass.as_str())
             .await
             .map_err(|e| format!("Auth mot de passe rejetée: {}", e))?
     };
 
     if !authenticated {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.disconnect(russh::Disconnect::ByApplication, "", "en"),
+        )
+        .await;
         return Err("Authentification refusée par le serveur".into());
     }
 
@@ -328,10 +392,14 @@ async fn connect_server(
     sessions.insert(
         session_id,
         ServerSession {
-            ssh_session: Some(Arc::new(tokio::sync::Mutex::new(session))),
+            ssh_session: Some(Arc::new(Mutex::new(session))),
             pty_sender: None,
+            pty_task: None,
             sftp: Some(Arc::new(sftp)),
+            sftp_semaphore: Some(Arc::new(Semaphore::new(8))),
             ftp: None,
+            ftp_pool: None,
+            ftp_config: None,
             protocol,
             current_remote_path: "/".into(),
         },
@@ -342,21 +410,20 @@ async fn connect_server(
 
 #[tauri::command]
 async fn disconnect_server(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    if let Some(mut sess) = sessions.remove(&session_id) {
-        if let Some(ftp_arc) = sess.ftp.take() {
-            let mut ftp = ftp_arc.lock().await;
-            let _ = ftp.quit();
-        }
-        if let Some(ssh_arc) = sess.ssh_session.take() {
-            let ssh = ssh_arc.lock().await;
-            let _ = ssh
-                .disconnect(russh::Disconnect::ByApplication, "", "en")
-                .await;
-        }
+    ensure_valid_id(&session_id, "de session")?;
+    state.cancel_session_transfers(&session_id).await;
+
+    // Retirer la session et relâcher immédiatement le verrou global avant de fermer les sockets réseau
+    let removed = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&session_id)
+    };
+
+    if let Some(sess) = removed {
+        cleanup_session_resources(sess).await;
     }
 
-    let temp_preview = std::env::temp_dir().join("Gens-RFT").join("preview").join(&session_id);
+    let temp_preview = local::pid_temp_root().join("preview").join(&session_id);
     let _ = tokio::fs::remove_dir_all(temp_preview).await;
 
     Ok(())
@@ -368,7 +435,8 @@ async fn cancel_current_transfer(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     if let Some(id) = transfer_id {
-        state.cancel_transfer(&id).await;
+        ensure_valid_id(&id, "de transfert")?;
+        state.cancel_transfer(&id, None).await;
     } else {
         state.cancel_all().await;
     }
@@ -383,76 +451,115 @@ async fn start_ssh_pty(
     rows: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let ssh_arc = {
-        let sessions = state.sessions.lock().await;
+    ensure_valid_id(&session_id, "de session")?;
+    let (ssh_arc, old_sender, old_task) = {
+        let mut sessions = state.sessions.lock().await;
         let sess = sessions
-            .get(&session_id)
+            .get_mut(&session_id)
             .ok_or_else(|| "Session SSH inactive".to_string())?;
 
-        sess.ssh_session
+        let old_sender = sess.pty_sender.take();
+        let old_task = sess.pty_task.take();
+        let ssh_arc = sess
+            .ssh_session
             .clone()
-            .ok_or_else(|| "Session SSH inactive".to_string())?
+            .ok_or_else(|| "Session SSH inactive".to_string())?;
+        (ssh_arc, old_sender, old_task)
     };
 
-    let session = ssh_arc.lock().await;
-    let mut channel = session
-        .channel_open_session()
+    // Ferme proprement un éventuel ancien canal PTY sans retenir le verrou global
+    if old_sender.is_some() || old_task.is_some() {
+        stop_pty_gracefully(old_sender, old_task).await;
+    }
+
+    let session = tokio::time::timeout(Duration::from_secs(15), ssh_arc.lock())
         .await
+        .map_err(|_| "Timeout verrou session SSH".to_string())?;
+    let mut channel = tokio::time::timeout(Duration::from_secs(15), session.channel_open_session())
+        .await
+        .map_err(|_| "Timeout ouverture canal PTY".to_string())?
         .map_err(|e| format!("Impossible d'ouvrir un canal PTY: {}", e))?;
 
-    channel
-        .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| format!("Échec allocation PTY: {}", e))?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]),
+    )
+    .await
+    .map_err(|_| "Timeout allocation PTY".to_string())?
+    .map_err(|e| format!("Échec allocation PTY: {}", e))?;
 
-    channel
-        .request_shell(true)
+    tokio::time::timeout(Duration::from_secs(15), channel.request_shell(true))
         .await
+        .map_err(|_| "Timeout lancement shell".to_string())?
         .map_err(|e| format!("Échec lancement shell: {}", e))?;
     drop(session);
 
     let (tx, mut rx) = mpsc::channel::<PtyCommand>(128);
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get_mut(&session_id) {
-            sess.pty_sender = Some(tx);
-        }
-    }
-
     let event_name = format!("ssh_pty_output_{}", session_id);
-    tokio::spawn(async move {
+    let closed_event_name = format!("ssh_pty_closed_{}", session_id);
+    let handle = tokio::spawn(async move {
+        let mut pending: Vec<u8> = Vec::with_capacity(PTY_BATCH_THRESHOLD);
+        let flush_timer = tokio::time::sleep(PTY_BATCH_INTERVAL);
+        tokio::pin!(flush_timer);
+        let mut timer_armed = false;
+
         loop {
             tokio::select! {
                 msg = channel.wait() => {
                     match msg {
-                        Some(ChannelMsg::Data { ref data }) => {
-                            let text = String::from_utf8_lossy(data).to_string();
-                            let _ = app.emit(&event_name, text);
+                        Some(ChannelMsg::Data { ref data }) | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                            pending.extend_from_slice(data);
+                            if pending.len() >= PTY_BATCH_THRESHOLD {
+                                flush_pty_utf8(&app, &event_name, &mut pending, false);
+                                timer_armed = false;
+                                tokio::task::yield_now().await;
+                            } else if !timer_armed {
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + PTY_BATCH_INTERVAL);
+                                timer_armed = true;
+                            }
                         }
-                        Some(ChannelMsg::ExtendedData { ref data, .. }) => {
-                            let text = String::from_utf8_lossy(data).to_string();
-                            let _ = app.emit(&event_name, text);
+                        Some(ChannelMsg::Eof) | None => {
+                            flush_pty_utf8(&app, &event_name, &mut pending, true);
+                            let _ = app.emit(&closed_event_name, ());
+                            break;
                         }
-                        Some(ChannelMsg::Eof) | None => break,
                         _ => {}
                     }
+                }
+                _ = &mut flush_timer, if timer_armed => {
+                    flush_pty_utf8(&app, &event_name, &mut pending, false);
+                    timer_armed = false;
                 }
                 cmd = rx.recv() => {
                     match cmd {
                         Some(PtyCommand::Input(bytes)) => {
                             if channel.data(&bytes[..]).await.is_err() {
+                                flush_pty_utf8(&app, &event_name, &mut pending, true);
+                                let _ = app.emit(&closed_event_name, ());
                                 break;
                             }
                         }
                         Some(PtyCommand::Resize { cols, rows }) => {
                             let _ = channel.window_change(cols, rows, 0, 0).await;
                         }
-                        None => break,
+                        None => {
+                            flush_pty_utf8(&app, &event_name, &mut pending, true);
+                            let _ = channel.close().await;
+                            break;
+                        }
                     }
                 }
             }
         }
     });
+
+    let mut sessions = state.sessions.lock().await;
+    if let Some(sess) = sessions.get_mut(&session_id) {
+        sess.pty_sender = Some(tx);
+        sess.pty_task = Some(handle);
+    } else {
+        handle.abort();
+    }
 
     Ok(())
 }
@@ -463,13 +570,15 @@ async fn write_ssh_pty(
     data: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().await;
-    if let Some(sess) = sessions.get(&session_id) {
-        if let Some(tx) = sess.pty_sender.as_ref() {
-            tx.send(PtyCommand::Input(data.into_bytes()))
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+    ensure_valid_id(&session_id, "de session")?;
+    let tx_opt = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).and_then(|s| s.pty_sender.clone())
+    };
+    if let Some(tx) = tx_opt {
+        tx.send(PtyCommand::Input(data.into_bytes()))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -481,231 +590,67 @@ async fn resize_ssh_pty(
     rows: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().await;
-    if let Some(sess) = sessions.get(&session_id) {
-        if let Some(tx) = sess.pty_sender.as_ref() {
-            tx.send(PtyCommand::Resize { cols, rows })
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+    ensure_valid_id(&session_id, "de session")?;
+    let tx_opt = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).and_then(|s| s.pty_sender.clone())
+    };
+    if let Some(tx) = tx_opt {
+        tx.send(PtyCommand::Resize { cols, rows })
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.to_lowercase().starts_with("total ") {
-        return None;
-    }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-    // 1. Format Unix prioritaire (ProFTPD, vsftpd, Pure-FTPd): "drwxr-xr-x 2 user group 4096 Nov 09 10:00 dirname"
-    if parts.len() >= 9
-        && (trimmed.starts_with('d') || trimmed.starts_with('-') || trimmed.starts_with('l'))
-    {
-        let mut is_dir = trimmed.starts_with('d');
-        let size = parts[4].parse::<u64>().unwrap_or(0);
-
-        // Préserver exactement les espaces multiples du nom de fichier après le 8ème champ
-        let mut space_count = 0;
-        let mut in_whitespace = false;
-        let mut name_start_idx = 0;
-        for (i, ch) in trimmed.char_indices() {
-            if ch.is_whitespace() {
-                if !in_whitespace {
-                    space_count += 1;
-                    in_whitespace = true;
-                }
-            } else if in_whitespace {
-                in_whitespace = false;
-                if space_count == 8 {
-                    name_start_idx = i;
-                    break;
-                }
-            }
-        }
-
-        let raw_name = if name_start_idx > 0 && name_start_idx < trimmed.len() {
-            trimmed[name_start_idx..].to_string()
-        } else {
-            parts[8..].join(" ")
-        };
-
-        let name = if let Some((link_name, target)) = raw_name.split_once(" -> ") {
-            let t = target.trim();
-            if t.ends_with('/') || is_dir {
-                is_dir = true;
-            }
-            link_name.trim().to_string()
-        } else {
-            raw_name
-        };
-        if name == "." || name == ".." || name.is_empty() {
-            return None;
-        }
-
-        let permissions = if parts[0].len() >= 10 {
-            let mut mode = 0u32;
-            let bytes = parts[0].as_bytes();
-            if bytes[1] == b'r' { mode |= 0o400; }
-            if bytes[2] == b'w' { mode |= 0o200; }
-            if bytes[3] == b'x' || bytes[3] == b's' { mode |= 0o100; }
-            if bytes[4] == b'r' { mode |= 0o040; }
-            if bytes[5] == b'w' { mode |= 0o020; }
-            if bytes[6] == b'x' || bytes[6] == b's' { mode |= 0o010; }
-            if bytes[7] == b'r' { mode |= 0o004; }
-            if bytes[8] == b'w' { mode |= 0o002; }
-            if bytes[9] == b'x' || bytes[9] == b't' { mode |= 0o001; }
-            Some(mode)
-        } else {
-            None
-        };
-
-        let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-        return Some(FileEntry {
-            name,
-            path: full_path,
-            is_dir,
-            size,
-            permissions,
-        });
-    }
-
-    // 2. Format DOS (Windows IIS FTP): "01-02-23 04:50PM <DIR> dirname" ou "01-02-23 04:50PM 1024 filename.txt"
-    if parts.len() >= 4 && (parts[2] == "<DIR>" || parts[2].parse::<u64>().is_ok()) {
-        let is_dos_date = parts[0].contains('-') || parts[0].contains('/');
-        let is_dos_time = parts[1].contains(':');
-        if is_dos_date && is_dos_time {
-            let is_dir = parts[2] == "<DIR>";
-            let size = if is_dir {
-                0
-            } else {
-                parts[2].parse::<u64>().unwrap_or(0)
-            };
-            let name = parts[3..].join(" ");
-            if name == "." || name == ".." || name.is_empty() {
-                return None;
-            }
-            let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-            return Some(FileEntry {
-                name,
-                path: full_path,
-                is_dir,
-                size,
-                permissions: None,
-            });
-        }
-    }
-
-    // 3. Fallback simple si c'est juste un chemin ou un nom (provenant de nlst)
-    let raw_name = trimmed.split('/').last().unwrap_or(trimmed).to_string();
-    let name = raw_name.trim_end_matches('/').to_string();
-    if name.is_empty() || name == "." || name == ".." {
-        return None;
-    }
-    let is_dir = trimmed.ends_with('/');
-    let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-    Some(FileEntry {
-        name,
-        path: full_path,
-        is_dir,
-        size: 0,
-        permissions: None,
-    })
 }
 
 #[tauri::command]
 async fn list_remote_dir(
     session_id: String,
+    app: AppHandle,
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileEntry>, String> {
+    ensure_valid_id(&session_id, "de session")?;
     let target_path = path.unwrap_or_else(|| "/".into());
+    if !is_valid_remote_path(&target_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
 
-    let (protocol, sftp, ftp) = {
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let mut sessions = state.sessions.lock().await;
         let sess = sessions
             .get_mut(&session_id)
             .ok_or_else(|| "Session introuvable ou déconnectée".to_string())?;
         sess.current_remote_path = target_path.clone();
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-
-        let lines = match ftp_guard.list(Some(&target_path)) {
-            Ok(l) if !l.is_empty() => l,
-            _ => ftp_guard
-                .nlst(Some(&target_path))
-                .map_err(|e| e.to_string())?,
-        };
-
-        let mut entries = Vec::new();
-        for line in lines {
-            if let Some(entry) = parse_ftp_entry(&line, &target_path) {
-                entries.push(entry);
-            }
-        }
-
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-
-        return Ok(entries);
+        return tokio::task::spawn_blocking(move || {
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                ftp::list_entries_blocking(stream, &target_path)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
-    let mut dir = sftp
-        .read_dir(&target_path)
-        .await
-        .map_err(|e| format!("Erreur dossier: {}", e))?;
-    let mut entries = Vec::new();
-
-    while let Some(file) = dir.next() {
-        let name = file.file_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-
-        let full_path = if target_path.ends_with('/') {
-            format!("{}{}", target_path, name)
-        } else {
-            format!("{}/{}", target_path, name)
-        };
-
-        let mut is_dir = file.file_type().is_dir();
-        if file.file_type().is_symlink() {
-            if let Ok(target_meta) = sftp.metadata(&full_path).await {
-                if target_meta.is_dir() {
-                    is_dir = true;
-                }
+    match sftp::list_entries_sftp(&sftp, &target_path).await {
+        Ok(entries) => Ok(entries),
+        Err(err) => {
+            if sftp.canonicalize(".").await.is_err() {
+                let _ = app.emit("sftp_session_lost", session_id.clone());
             }
+            Err(err)
         }
-
-        let size = file.metadata().size.unwrap_or(0);
-        let permissions = file.metadata().permissions;
-
-        entries.push(FileEntry {
-            name,
-            path: full_path,
-            is_dir,
-            size,
-            permissions,
-        });
     }
-
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-
-    Ok(entries)
 }
 
 #[tauri::command]
@@ -714,291 +659,43 @@ async fn list_remote_subdirs(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        let lines = match ftp_guard.list(Some(&path)) {
-            Ok(l) if !l.is_empty() => l,
-            _ => ftp_guard.nlst(Some(&path)).unwrap_or_default(),
-        };
-
-        let mut dirs = Vec::new();
-        for line in lines {
-            if let Some(entry) = parse_ftp_entry(&line, &path) {
-                if entry.is_dir {
-                    dirs.push(entry.name);
-                }
-            }
-        }
-        dirs.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-        return Ok(dirs);
+        return tokio::task::spawn_blocking(move || {
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                let entries = ftp::list_entries_blocking(stream, &path)?;
+                let mut dirs: Vec<String> = entries
+                    .into_iter()
+                    .filter(|e| e.is_dir)
+                    .map(|e| e.name)
+                    .collect();
+                dirs.sort_by_cached_key(|a| a.to_lowercase());
+                Ok(dirs)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
-    let mut dir = sftp
-        .read_dir(&path)
-        .await
-        .map_err(|e| format!("Erreur permission: {}", e))?;
-    let mut dirs = Vec::new();
-
-    while let Some(file) = dir.next() {
-        let name = file.file_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-
-        let full_path = if path.ends_with('/') {
-            format!("{}{}", path, name)
-        } else {
-            format!("{}/{}", path, name)
-        };
-
-        let mut is_dir = file.file_type().is_dir();
-        if file.file_type().is_symlink() {
-            if let Ok(target_meta) = sftp.metadata(&full_path).await {
-                if target_meta.is_dir() {
-                    is_dir = true;
-                }
-            }
-        }
-
-        if is_dir {
-            dirs.push(name);
-        }
-    }
-
-    dirs.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    Ok(dirs)
-}
-
-struct ProgressRead<'a, R: Read> {
-    inner: R,
-    app: &'a AppHandle,
-    transfer_id: &'a str,
-    filename: &'a str,
-    total: u64,
-    transferred: u64,
-    last_emit: Instant,
-    cancel_flag: Arc<AtomicBool>,
-}
-
-impl<'a, R: Read> Read for ProgressRead<'a, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.cancel_flag.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Transfert annulé par l'utilisateur",
-            ));
-        }
-        let n = self.inner.read(buf)?;
-        self.transferred += n as u64;
-
-        if self.last_emit.elapsed().as_millis() >= 100
-            || (self.total > 0 && self.transferred >= self.total)
-        {
-            let percent = if self.total > 0 {
-                ((self.transferred as f64 / self.total as f64) * 100.0) as f32
-            } else {
-                100.0
-            };
-
-            let _ = self.app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: self.transfer_id.to_string(),
-                    filename: self.filename.to_string(),
-                    transferred: self.transferred,
-                    total: self.total,
-                    percent,
-                    direction: "upload".into(),
-                },
-            );
-            self.last_emit = Instant::now();
-        }
-
-        Ok(n)
-    }
-}
-
-struct ProgressWrite<'a, W: Write> {
-    inner: W,
-    app: &'a AppHandle,
-    transfer_id: &'a str,
-    filename: &'a str,
-    total: u64,
-    transferred: u64,
-    last_emit: Instant,
-    cancel_flag: Arc<AtomicBool>,
-}
-
-impl<'a, W: Write> Write for ProgressWrite<'a, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.cancel_flag.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Transfert annulé par l'utilisateur",
-            ));
-        }
-        let n = self.inner.write(buf)?;
-        self.transferred += n as u64;
-
-        if self.last_emit.elapsed().as_millis() >= 100
-            || (self.total > 0 && self.transferred >= self.total)
-        {
-            let percent = if self.total > 0 {
-                ((self.transferred as f64 / self.total as f64) * 100.0) as f32
-            } else {
-                0.0
-            };
-
-            let _ = self.app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: self.transfer_id.to_string(),
-                    filename: self.filename.to_string(),
-                    transferred: self.transferred,
-                    total: self.total,
-                    percent,
-                    direction: "download".into(),
-                },
-            );
-            self.last_emit = Instant::now();
-        }
-
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-async fn upload_single_file_sftp(
-    app: &AppHandle,
-    sftp: &SftpSession,
-    cancel_flag: &AtomicBool,
-    transfer_id: &str,
-    local_path: &str,
-    remote_path: &str,
-    folder_progress: Option<(Arc<Mutex<u64>>, u64)>,
-) -> Result<(), String> {
-    let local_raw = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| format!("Erreur ouverture {}: {}", local_path, e))?;
-
-    let total_size = local_raw.metadata().await.map(|m| m.len()).unwrap_or(0);
-    let mut local_file = tokio::io::BufReader::with_capacity(256 * 1024, local_raw);
-
-    // Upload atomique : on passe par un fichier temporaire pour ne jamais écraser
-    // ou détruire un fichier distant existant si le transfert est annulé au milieu.
-    let temp_remote_path = format!("{}.gens_part_{}", remote_path, transfer_id);
-    let mut remote_file = sftp
-        .create(&temp_remote_path)
-        .await
-        .map_err(|e| format!("Erreur création distante: {}", e))?;
-
-    let filename = Path::new(local_path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let mut buffer = vec![0u8; 256 * 1024];
-    let mut transferred: u64 = 0;
-    let mut last_emit = Instant::now();
-
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            drop(remote_file);
-            let _ = sftp.remove_file(&temp_remote_path).await;
-            return Err("Transfert annulé par l'utilisateur".to_string());
-        }
-
-        let n = local_file
-            .read(&mut buffer)
-            .await
-            .map_err(|e| format!("Erreur lecture locale: {}", e))?;
-
-        if n == 0 {
-            break;
-        }
-
-        if let Err(e) = remote_file.write_all(&buffer[..n]).await {
-            drop(remote_file);
-            let _ = sftp.remove_file(&temp_remote_path).await;
-            return Err(format!("Erreur écriture distante: {}", e));
-        }
-
-        transferred += n as u64;
-
-        let (emit_transferred, emit_total, percent) = if let Some((ref cum_lock, folder_total)) = folder_progress {
-            let mut cum = cum_lock.lock().await;
-            *cum += n as u64;
-            let current_cum = *cum;
-            let p = if folder_total > 0 {
-                ((current_cum as f64 / folder_total as f64) * 100.0).min(99.9) as f32
-            } else {
-                0.0
-            };
-            (current_cum, folder_total, p)
-        } else {
-            let p = if total_size > 0 {
-                ((transferred as f64 / total_size as f64) * 100.0).min(99.9) as f32
-            } else {
-                0.0
-            };
-            (transferred, total_size, p)
-        };
-
-        if last_emit.elapsed().as_millis() >= 100 || (total_size > 0 && transferred >= total_size) {
-            let _ = app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: transfer_id.to_string(),
-                    filename: filename.clone(),
-                    transferred: emit_transferred,
-                    total: emit_total,
-                    percent,
-                    direction: "upload".into(),
-                },
-            );
-            last_emit = Instant::now();
-        }
-    }
-
-    drop(remote_file);
-
-    // Finalisation atomique : on remplace la cible finale par le fichier temporaire
-    if let Err(_) = sftp.rename(&temp_remote_path, remote_path).await {
-        let _ = sftp.remove_file(remote_path).await;
-        sftp.rename(&temp_remote_path, remote_path)
-            .await
-            .map_err(|e| format!("Erreur finalisation fichier distant: {}", e))?;
-    }
-
-    if folder_progress.is_none() {
-        let _ = app.emit(
-            "transfer_progress",
-            TransferProgress {
-                transfer_id: transfer_id.to_string(),
-                filename: filename.clone(),
-                transferred: total_size,
-                total: total_size,
-                percent: 100.0,
-                direction: "upload".into(),
-            },
-        );
-    }
-
-    Ok(())
+    sftp::list_subdirs_sftp(&sftp, &path).await
 }
 
 async fn upload_item_inner(
@@ -1010,17 +707,30 @@ async fn upload_item_inner(
     dest_filename: Option<String>,
     state: &AppState,
 ) -> Result<String, String> {
-    let cancel_flag = state.get_or_create_cancel_token(transfer_id).await;
+    ensure_valid_id(session_id, "de session")?;
+    ensure_valid_id(transfer_id, "de transfert")?;
+    if !is_valid_remote_path(remote_dest_dir) {
+        return Err("Dossier distant de destination invalide".to_string());
+    }
+
+    let cancel_flag = state.get_or_create_cancel_token(transfer_id, session_id).await;
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("Transfert annulé par l'utilisateur".to_string());
     }
 
-    let (protocol, sftp, ftp) = {
+    let (protocol, sftp, sftp_sem, ftp, ftp_pool, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.sftp_semaphore.clone(),
+            sess.ftp.clone(),
+            sess.ftp_pool.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     let source = Path::new(local_path);
@@ -1033,150 +743,68 @@ async fn upload_item_inner(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| original_name.to_string());
 
+    if !is_valid_remote_filename(&target_name) {
+        return Err("Nom de fichier de destination invalide".to_string());
+    }
+
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
+        let app_c = app.clone();
+        let tid = transfer_id.to_string();
+        let lpath = local_path.to_string();
+        let rdir = remote_dest_dir.to_string();
+        let tname = target_name.clone();
+        let cancel_c = cancel_flag.clone();
 
-        if source.is_dir() {
-            let root_remote = format!("{}/{}", remote_dest_dir.trim_end_matches('/'), target_name);
+        return tokio::task::spawn_blocking(move || {
+            // Préférer une connexion FTP du pool (évite la contention et les handshakes répétés)
+            if let Some(cfg) = ftp_cfg
+                && let Ok(mut dedicated_ftp) = acquire_ftp_transfer_conn(&ftp_pool, &cfg)
             {
-                let mut ftp_guard = ftp_arc.lock().await;
-                let _ = ftp_guard.mkdir(&root_remote);
+                let res = ftp::upload_item_blocking(
+                    &mut dedicated_ftp,
+                    &app_c,
+                    &tid,
+                    &lpath,
+                    &rdir,
+                    &tname,
+                    cancel_c,
+                );
+                let ok = res.is_ok();
+                release_ftp_transfer_conn(&ftp_pool, dedicated_ftp, ok);
+                return res;
             }
-
-            for entry in WalkDir::new(local_path).into_iter().filter_map(|e| e.ok()) {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Transfert annulé".to_string());
-                }
-
-                let rel = entry
-                    .path()
-                    .strip_prefix(local_path)
-                    .map_err(|e| e.to_string())?;
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if rel_str.is_empty() {
-                    continue;
-                }
-
-                let remote_target = format!("{}/{}", root_remote, rel_str);
-                if entry.file_type().is_dir() {
-                    let mut ftp_guard = ftp_arc.lock().await;
-                    let _ = ftp_guard.mkdir(&remote_target);
-                } else {
-                    let file = fs::File::open(entry.path()).map_err(|e| e.to_string())?;
-                    let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    let filename = entry.file_name().to_string_lossy().to_string();
-
-                    let mut progress_reader = ProgressRead {
-                        inner: file,
-                        app,
-                        transfer_id,
-                        filename: &filename,
-                        total: total_size,
-                        transferred: 0,
-                        last_emit: Instant::now(),
-                        cancel_flag: cancel_flag.clone(),
-                    };
-
-                    let mut ftp_guard = ftp_arc.lock().await;
-                    ftp_guard
-                        .put_file(&remote_target, &mut progress_reader)
-                        .map_err(|e| format!("Erreur upload FTP {}: {}", filename, e))?;
-                }
-            }
-        } else {
-            let remote_target =
-                format!("{}/{}", remote_dest_dir.trim_end_matches('/'), target_name);
-            let file = fs::File::open(local_path).map_err(|e| e.to_string())?;
-            let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-            let mut progress_reader = ProgressRead {
-                inner: file,
-                app,
-                transfer_id,
-                filename: &target_name,
-                total: total_size,
-                transferred: 0,
-                last_emit: Instant::now(),
-                cancel_flag: cancel_flag.clone(),
-            };
-
-            let mut ftp_guard = ftp_arc.lock().await;
-            if let Err(e) = ftp_guard.put_file(&remote_target, &mut progress_reader) {
-                let _ = ftp_guard.rm(&remote_target);
-                return Err(format!("Erreur upload FTP: {}", e));
-            }
-        }
-
-        return Ok("Upload FTP terminé".into());
+            let mut ftp_guard = ftp_arc
+                .lock()
+                .map_err(|_| "Verrou FTP corrompu".to_string())?;
+            ftp::upload_item_blocking(&mut ftp_guard, &app_c, &tid, &lpath, &rdir, &tname, cancel_c)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
+    let sftp_sem = sftp_sem.unwrap_or_else(|| Arc::new(Semaphore::new(8)));
 
     if source.is_dir() {
         let root_remote = format!("{}/{}", remote_dest_dir.trim_end_matches('/'), target_name);
-        let _ = sftp.create_dir(&root_remote).await;
-
-        let mut files_to_upload: Vec<(PathBuf, String, u64)> = Vec::new();
-        let mut total_folder_bytes: u64 = 0;
-
-        for entry in WalkDir::new(local_path).into_iter().filter_map(|e| e.ok()) {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Transfert annulé par l'utilisateur".to_string());
-            }
-            let rel = match entry.path().strip_prefix(local_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if rel_str.is_empty() {
-                continue;
-            }
-
-            let remote_target = format!("{}/{}", root_remote, rel_str);
-            if entry.file_type().is_dir() {
-                let _ = sftp.create_dir(&remote_target).await;
-            } else {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                total_folder_bytes += size;
-                files_to_upload.push((entry.path().to_path_buf(), remote_target, size));
-            }
-        }
-
-        let cumulative = Arc::new(Mutex::new(0u64));
-        let mut upload_errors = Vec::new();
-        for (local_file_path, remote_target, _) in files_to_upload {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Transfert annulé par l'utilisateur".to_string());
-            }
-
-            if let Err(e) = upload_single_file_sftp(
-                app,
-                &sftp,
-                &cancel_flag,
-                transfer_id,
-                &local_file_path.to_string_lossy(),
-                &remote_target,
-                Some((cumulative.clone(), total_folder_bytes)),
-            )
-            .await
-            {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Transfert annulé par l'utilisateur".to_string());
-                }
-                upload_errors.push(format!("{}: {}", remote_target, e));
-            }
-        }
-
-        if !upload_errors.is_empty() {
-            return Err(format!(
-                "{} fichier(s) n'ont pas pu être uploadés : {}",
-                upload_errors.len(),
-                upload_errors.join("; ")
-            ));
-        }
+        sftp::upload_dir_sftp(
+            app,
+            &sftp,
+            &sftp_sem,
+            cancel_flag,
+            transfer_id,
+            local_path,
+            &root_remote,
+        )
+        .await?;
     } else {
+        let _permit = sftp_sem
+            .acquire()
+            .await
+            .map_err(|e| format!("Sémaphore SFTP fermé: {}", e))?;
         let remote_target = format!("{}/{}", remote_dest_dir.trim_end_matches('/'), target_name);
-        upload_single_file_sftp(
+        sftp::upload_single_file_sftp(
             app,
             &sftp,
             &cancel_flag,
@@ -1215,192 +843,52 @@ async fn upload_item(
     res
 }
 
-fn sanitize_windows_filename(name: &str) -> String {
-    let clean = name.replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_");
-    let mut trimmed = clean.trim_end_matches(['.', ' ']).to_string();
-    if trimmed.is_empty() {
-        return "unnamed_file".to_string();
-    }
-    // Gérer les noms de périphériques réservés MS-DOS (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-    let uppercase = trimmed.to_ascii_uppercase();
-    let base_name = uppercase.split('.').next().unwrap_or(&uppercase);
-    const DOS_RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if DOS_RESERVED.contains(&base_name) {
-        trimmed = format!("_{}", trimmed);
-    }
-    trimmed
-}
-
-async fn download_single_file_sftp(
-    app: &AppHandle,
-    sftp: &SftpSession,
-    cancel_flag: &AtomicBool,
-    transfer_id: &str,
-    remote_path: &str,
-    local_path: &Path,
-    folder_progress: Option<(Arc<Mutex<u64>>, u64)>,
-) -> Result<(), String> {
-    if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            format!(
-                "Impossible de créer le dossier local ({}): {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| format!("Erreur lecture distante ({}): {}", remote_path, e))?;
-
-    let total_size = match sftp.metadata(remote_path).await {
-        Ok(m) => m.size.unwrap_or(0),
-        Err(_) => remote_file
-            .metadata()
-            .await
-            .map(|m| m.size.unwrap_or(0))
-            .unwrap_or(0),
-    };
-
-    let temp_local_file = match local_path.file_name() {
-        Some(name) => local_path.with_file_name(format!("{}.gens_part_{}", name.to_string_lossy(), transfer_id)),
-        None => local_path.to_path_buf(),
-    };
-
-    let local_raw = tokio::fs::File::create(&temp_local_file)
-        .await
-        .map_err(|e| format!("Erreur création locale ({}): {}", local_path.display(), e))?;
-    let mut local_file = tokio::io::BufWriter::with_capacity(256 * 1024, local_raw);
-
-    let filename = local_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let mut buffer = vec![0u8; 256 * 1024];
-    let mut transferred: u64 = 0;
-    let mut last_emit = Instant::now();
-
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            drop(local_file);
-            let _ = tokio::fs::remove_file(&temp_local_file).await;
-            return Err("Transfert annulé par l'utilisateur".to_string());
-        }
-
-        let n = match remote_file.read(&mut buffer).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                drop(local_file);
-                let _ = tokio::fs::remove_file(&temp_local_file).await;
-                return Err(format!("Erreur lecture: {}", e));
-            }
-        };
-
-        if n == 0 {
-            break;
-        }
-
-        if let Err(e) = local_file.write_all(&buffer[..n]).await {
-            drop(local_file);
-            let _ = tokio::fs::remove_file(&temp_local_file).await;
-            return Err(format!("Erreur écriture ({}): {}", local_path.display(), e));
-        }
-
-        transferred += n as u64;
-
-        let (emit_transferred, emit_total, percent) = if let Some((ref cum_lock, folder_total)) = folder_progress {
-            let mut cum = cum_lock.lock().await;
-            *cum += n as u64;
-            let current_cum = *cum;
-            let p = if folder_total > 0 {
-                ((current_cum as f64 / folder_total as f64) * 100.0).min(99.9) as f32
-            } else {
-                0.0
-            };
-            (current_cum, folder_total, p)
-        } else {
-            let p = if total_size > 0 {
-                ((transferred as f64 / total_size as f64) * 100.0).min(99.9) as f32
-            } else {
-                0.0
-            };
-            (transferred, total_size, p)
-        };
-
-        if last_emit.elapsed().as_millis() >= 100 || (total_size > 0 && transferred >= total_size) {
-            let _ = app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: transfer_id.to_string(),
-                    filename: filename.clone(),
-                    transferred: emit_transferred,
-                    total: emit_total,
-                    percent,
-                    direction: "download".into(),
-                },
-            );
-            last_emit = Instant::now();
-        }
-    }
-
-    let _ = local_file.flush().await;
-    drop(local_file);
-
-    if local_path.exists() {
-        let _ = tokio::fs::remove_file(local_path).await;
-    }
-    tokio::fs::rename(&temp_local_file, local_path)
-        .await
-        .map_err(|e| format!("Erreur finalisation locale: {}", e))?;
-
-    if folder_progress.is_none() {
-        let _ = app.emit(
-            "transfer_progress",
-            TransferProgress {
-                transfer_id: transfer_id.to_string(),
-                filename: filename.clone(),
-                transferred: total_size,
-                total: total_size,
-                percent: 100.0,
-                direction: "download".into(),
-            },
-        );
-    }
-
-    Ok(())
+struct DownloadRequest<'a> {
+    session_id: &'a str,
+    transfer_id: &'a str,
+    remote_path: &'a str,
+    local_dest_dir: &'a str,
+    dest_filename: Option<String>,
+    is_dir: bool,
 }
 
 async fn download_item_inner(
-    session_id: &str,
     app: &AppHandle,
-    transfer_id: &str,
-    remote_path: &str,
-    local_dest_dir: &str,
-    dest_filename: Option<String>,
-    is_dir: bool,
+    req: DownloadRequest<'_>,
     state: &AppState,
 ) -> Result<String, String> {
-    let cancel_flag = state.get_or_create_cancel_token(transfer_id).await;
+    ensure_valid_id(req.session_id, "de session")?;
+    ensure_valid_id(req.transfer_id, "de transfert")?;
+    if !is_valid_remote_path(req.remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+
+    let cancel_flag = state
+        .get_or_create_cancel_token(req.transfer_id, req.session_id)
+        .await;
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("Transfert annulé par l'utilisateur".to_string());
     }
 
-    let (protocol, sftp, ftp) = {
+    let (protocol, sftp, sftp_sem, ftp, ftp_pool, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
-            .get(session_id)
+            .get(req.session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.sftp_semaphore.clone(),
+            sess.ftp.clone(),
+            sess.ftp_pool.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
-    let normalized_dest = local_dest_dir.trim().replace('/', "\\");
+    #[cfg(windows)]
+    let normalized_dest = req.local_dest_dir.trim().replace('/', "\\");
+    #[cfg(not(windows))]
+    let normalized_dest = req.local_dest_dir.trim().to_string();
     let base_dest = PathBuf::from(&normalized_dest);
 
     tokio::fs::create_dir_all(&base_dest).await.map_err(|e| {
@@ -1411,234 +899,91 @@ async fn download_item_inner(
         )
     })?;
 
-    let raw_filename = Path::new(remote_path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let safe_filename = dest_filename
+    let raw_filename = remote_file_name(req.remote_path).unwrap_or("");
+    let safe_filename = req
+        .dest_filename
         .filter(|s| !s.trim().is_empty())
         .map(|s| sanitize_windows_filename(&s))
-        .unwrap_or_else(|| sanitize_windows_filename(&raw_filename));
+        .unwrap_or_else(|| sanitize_windows_filename(raw_filename));
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
+        let app_c = app.clone();
+        let tid = req.transfer_id.to_string();
+        let rpath = req.remote_path.to_string();
+        let safe_c = safe_filename.clone();
+        let cancel_c = cancel_flag.clone();
+        let is_dir = req.is_dir;
 
-        if is_dir {
-            let root_local_dir = base_dest.join(&safe_filename);
-            fs::create_dir_all(&root_local_dir).map_err(|e| e.to_string())?;
-
-            let mut visited = std::collections::HashSet::new();
-            visited.insert(remote_path.to_string());
-            let mut queue = vec![(remote_path.to_string(), root_local_dir, 0usize)];
-            while let Some((rem_dir, loc_dir, depth)) = queue.pop() {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Transfert annulé".to_string());
-                }
-
-                if depth > 40 {
-                    continue;
-                }
-
-                let lines = {
-                    let mut ftp_guard = ftp_arc.lock().await;
-                    ftp_guard.list(Some(&rem_dir)).unwrap_or_default()
-                };
-
-                for line in lines {
-                    if let Some(item) = parse_ftp_entry(&line, &rem_dir) {
-                        let sub_loc = loc_dir.join(sanitize_windows_filename(&item.name));
-                        if item.is_dir {
-                            if visited.insert(item.path.clone()) {
-                                let _ = fs::create_dir_all(&sub_loc);
-                                queue.push((item.path, sub_loc, depth + 1));
-                            }
-                        } else {
-                            let file = fs::File::create(&sub_loc).map_err(|e| e.to_string())?;
-                            let mut progress_writer = ProgressWrite {
-                                inner: file,
-                                app,
-                                transfer_id,
-                                filename: &item.name,
-                                total: item.size,
-                                transferred: 0,
-                                last_emit: Instant::now(),
-                                cancel_flag: cancel_flag.clone(),
-                            };
-
-                            let mut ftp_guard = ftp_arc.lock().await;
-                            let retr_res = ftp_guard.retr(&item.path, |stream| {
-                                let mut buffer = [0u8; 128 * 1024];
-                                loop {
-                                    let n = stream
-                                        .read(&mut buffer)
-                                        .map_err(suppaftp::FtpError::ConnectionError)?;
-                                    if n == 0 {
-                                        break;
-                                    }
-                                    progress_writer
-                                        .write_all(&buffer[..n])
-                                        .map_err(suppaftp::FtpError::ConnectionError)?;
-                                }
-                                Ok(())
-                            });
-                            if let Err(e) = retr_res {
-                                let _ = fs::remove_file(&sub_loc);
-                                return Err(format!("Erreur téléchargement FTP {}: {}", item.name, e));
-                            }
-                        }
-                    }
-                }
+        return tokio::task::spawn_blocking(move || {
+            if let Some(cfg) = ftp_cfg
+                && let Ok(mut dedicated_ftp) = acquire_ftp_transfer_conn(&ftp_pool, &cfg)
+            {
+                let res = ftp::download_item_blocking(
+                    &mut dedicated_ftp,
+                    &app_c,
+                    ftp::FtpDownloadArgs {
+                        transfer_id: &tid,
+                        remote_path: &rpath,
+                        base_dest: &base_dest,
+                        safe_filename: &safe_c,
+                        is_dir,
+                        cancel_flag: cancel_c,
+                    },
+                );
+                let ok = res.is_ok();
+                release_ftp_transfer_conn(&ftp_pool, dedicated_ftp, ok);
+                return res;
             }
-        } else {
-            let local_target = base_dest.join(&safe_filename);
-            let file = fs::File::create(&local_target).map_err(|e| e.to_string())?;
-
-            let total_size = {
-                let mut ftp_guard = ftp_arc.lock().await;
-                ftp_guard.size(remote_path).unwrap_or(0) as u64
-            };
-
-            let filename = local_target
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            let mut progress_writer = ProgressWrite {
-                inner: file,
-                app,
-                transfer_id,
-                filename: &filename,
-                total: total_size,
-                transferred: 0,
-                last_emit: Instant::now(),
-                cancel_flag: cancel_flag.clone(),
-            };
-
-            let mut ftp_guard = ftp_arc.lock().await;
-            let retr_res = ftp_guard
-                .retr(remote_path, |stream| {
-                    let mut buffer = [0u8; 128 * 1024];
-                    loop {
-                        let n = stream
-                            .read(&mut buffer)
-                            .map_err(suppaftp::FtpError::ConnectionError)?;
-                        if n == 0 {
-                            break;
-                        }
-                        progress_writer
-                            .write_all(&buffer[..n])
-                            .map_err(suppaftp::FtpError::ConnectionError)?;
-                    }
-                    Ok(())
-                });
-            drop(progress_writer);
-            if let Err(e) = retr_res {
-                let _ = fs::remove_file(&local_target);
-                return Err(format!("Erreur download FTP: {}", e));
-            }
-        }
-
-        return Ok(safe_filename);
+            let mut ftp_guard = ftp_arc
+                .lock()
+                .map_err(|_| "Verrou FTP corrompu".to_string())?;
+            ftp::download_item_blocking(
+                &mut ftp_guard,
+                &app_c,
+                ftp::FtpDownloadArgs {
+                    transfer_id: &tid,
+                    remote_path: &rpath,
+                    base_dest: &base_dest,
+                    safe_filename: &safe_c,
+                    is_dir,
+                    cancel_flag: cancel_c,
+                },
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
+    let sftp_sem = sftp_sem.unwrap_or_else(|| Arc::new(Semaphore::new(8)));
 
-    if is_dir {
+    if req.is_dir {
         let root_local_dir = base_dest.join(&safe_filename);
-        tokio::fs::create_dir_all(&root_local_dir)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut files_to_download: Vec<(String, PathBuf, u64)> = Vec::new();
-        let mut total_folder_bytes: u64 = 0;
-
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(remote_path.to_string());
-        let mut queue = vec![(remote_path.to_string(), root_local_dir, 0usize)];
-        while let Some((rem_dir, loc_dir, depth)) = queue.pop() {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Transfert annulé".to_string());
-            }
-
-            if depth > 40 {
-                continue;
-            }
-
-            if let Ok(mut dir) = sftp.read_dir(&rem_dir).await {
-                while let Some(item) = dir.next() {
-                    let sub_name = item.file_name();
-                    if sub_name == "." || sub_name == ".." {
-                        continue;
-                    }
-                    let safe_sub = sanitize_windows_filename(&sub_name);
-                    let sub_rem = format!("{}/{}", rem_dir.trim_end_matches('/'), sub_name);
-                    let sub_loc = loc_dir.join(safe_sub);
-
-                    let mut is_sub_dir = item.file_type().is_dir();
-                    if item.file_type().is_symlink() {
-                        if let Ok(target_meta) = sftp.metadata(&sub_rem).await {
-                            if target_meta.is_dir() && !visited.contains(&sub_rem) {
-                                is_sub_dir = true;
-                            }
-                        }
-                    }
-
-                    if is_sub_dir {
-                        if visited.insert(sub_rem.clone()) {
-                            let _ = tokio::fs::create_dir_all(&sub_loc).await;
-                            queue.push((sub_rem, sub_loc, depth + 1));
-                        }
-                    } else {
-                        let size = item.metadata().size.unwrap_or(0);
-                        total_folder_bytes += size;
-                        files_to_download.push((sub_rem, sub_loc, size));
-                    }
-                }
-            }
-        }
-
-        let cumulative = Arc::new(Mutex::new(0u64));
-        let mut download_errors = Vec::new();
-        for (sub_rem, sub_loc, _) in files_to_download {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Transfert annulé par l'utilisateur".to_string());
-            }
-
-            if let Err(e) = download_single_file_sftp(
-                app,
-                &sftp,
-                &cancel_flag,
-                transfer_id,
-                &sub_rem,
-                &sub_loc,
-                Some((cumulative.clone(), total_folder_bytes)),
-            )
-            .await
-            {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Transfert annulé par l'utilisateur".to_string());
-                }
-                download_errors.push(format!("{}: {}", sub_rem, e));
-            }
-        }
-
-        if !download_errors.is_empty() {
-            return Err(format!(
-                "{} fichier(s) n'ont pas pu être téléchargés : {}",
-                download_errors.len(),
-                download_errors.join("; ")
-            ));
-        }
+        sftp::download_dir_sftp(
+            app,
+            &sftp,
+            &sftp_sem,
+            cancel_flag,
+            req.transfer_id,
+            req.remote_path,
+            root_local_dir,
+        )
+        .await?;
     } else {
+        let _permit = sftp_sem
+            .acquire()
+            .await
+            .map_err(|e| format!("Sémaphore SFTP fermé: {}", e))?;
         let local_target = base_dest.join(&safe_filename);
-        download_single_file_sftp(
+        sftp::download_single_file_sftp(
             app,
             &sftp,
             &cancel_flag,
-            transfer_id,
-            remote_path,
+            req.transfer_id,
+            req.remote_path,
             &local_target,
+            None,
             None,
         )
         .await?;
@@ -1647,6 +992,7 @@ async fn download_item_inner(
     Ok(safe_filename)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn download_item(
     session_id: String,
@@ -1659,13 +1005,15 @@ async fn download_item(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let res = download_item_inner(
-        &session_id,
         &app,
-        &transfer_id,
-        &remote_path,
-        &local_dest_dir,
-        dest_filename,
-        is_dir,
+        DownloadRequest {
+            session_id: &session_id,
+            transfer_id: &transfer_id,
+            remote_path: &remote_path,
+            local_dest_dir: &local_dest_dir,
+            dest_filename,
+            is_dir,
+        },
         &state,
     )
     .await;
@@ -1679,63 +1027,36 @@ async fn read_remote_file_text(
     remote_path: String,
     state: State<'_, AppState>,
 ) -> Result<RemoteTextFile, String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-
-        if let Ok(size) = ftp_guard.size(&remote_path) {
-            if size > 5 * 1024 * 1024 {
-                return Err("Fichier trop volumineux (> 5 Mo) pour l'éditeur intégré.".to_string());
-            }
-        }
-
-        let cursor = ftp_guard
-            .retr_as_buffer(&remote_path)
-            .map_err(|e| e.to_string())?;
-        let buffer = cursor.into_inner();
-        if buffer.len() > 5 * 1024 * 1024 {
-            return Err("Fichier trop volumineux (> 5 Mo) pour l'éditeur intégré.".to_string());
-        }
-
-        if buffer.contains(&0) {
-            return Err("Le fichier est un binaire (caractères nuls détectés). Impossible de l'ouvrir dans l'éditeur de texte.".to_string());
-        }
-
-        let is_lossy = std::str::from_utf8(&buffer).is_err();
-        let content = String::from_utf8_lossy(&buffer).to_string();
-        return Ok(RemoteTextFile { content, is_lossy });
+        return tokio::task::spawn_blocking(move || {
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                ftp::read_text_bounded_blocking(stream, &remote_path)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
-
-    if let Ok(meta) = sftp.metadata(&remote_path).await {
-        if meta.size.unwrap_or(0) > 5 * 1024 * 1024 {
-            return Err("Fichier trop volumineux (> 5 Mo) pour l'éditeur intégré.".to_string());
-        }
-    }
-
-    let mut remote_file = sftp.open(&remote_path).await.map_err(|e| e.to_string())?;
-    let mut buffer = Vec::new();
-    remote_file
-        .read_to_end(&mut buffer)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if buffer.contains(&0) {
-        return Err("Le fichier est un binaire (caractères nuls détectés). Impossible de l'ouvrir dans l'éditeur de texte.".to_string());
-    }
-
-    let is_lossy = std::str::from_utf8(&buffer).is_err();
-    let content = String::from_utf8_lossy(&buffer).to_string();
-    Ok(RemoteTextFile { content, is_lossy })
+    sftp::read_text_sftp(&sftp, &remote_path).await
 }
 
 #[tauri::command]
@@ -1745,81 +1066,163 @@ async fn save_remote_file_text(
     content: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        let mut cursor = Cursor::new(content.into_bytes());
-        ftp_guard
-            .put_file(&remote_path, &mut cursor)
-            .map_err(|e| e.to_string())?;
-        return Ok(());
+        return tokio::task::spawn_blocking(move || {
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                ftp::save_text_blocking(stream, &remote_path, content.clone())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
-    let mut remote_file = sftp.create(&remote_path).await.map_err(|e| e.to_string())?;
-    remote_file
-        .write_all(content.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    sftp::save_text_sftp(&sftp, &remote_path, &content).await
 }
 
 #[tauri::command]
 async fn open_remote_with_system(
     session_id: String,
     remote_path: String,
+    confirm_executable: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_pool, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_pool.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
-    let raw_filename = Path::new(&remote_path)
-        .file_name()
-        .ok_or_else(|| "Nom de fichier invalide".to_string())?
-        .to_string_lossy();
-    let safe_filename = sanitize_windows_filename(&raw_filename);
+    let raw_filename = remote_file_name(&remote_path)
+        .ok_or_else(|| "Nom de fichier invalide".to_string())?;
+    let safe_filename = sanitize_windows_filename(raw_filename);
 
-    let temp_dir = std::env::temp_dir().join("Gens-RFT").join("preview").join(&session_id);
+    if is_dangerous_executable_filename(&safe_filename) && !confirm_executable.unwrap_or(false) {
+        return Err(format!("EXECUTABLE_CONFIRM_REQUIRED|{}", safe_filename));
+    }
+
+    let temp_dir = local::pid_temp_root().join("preview").join(&session_id);
     let _ = fs::create_dir_all(&temp_dir);
     let mut local_temp_file = temp_dir.join(&safe_filename);
-    // Si le fichier existe et est verrouillé par un processus tiers (ex: lecteur PDF/Word), on utilise un nom horodaté
-    if local_temp_file.exists() && fs::OpenOptions::new().write(true).open(&local_temp_file).is_err() {
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    if local_temp_file.exists()
+        && fs::OpenOptions::new()
+            .write(true)
+            .open(&local_temp_file)
+            .is_err()
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         local_temp_file = temp_dir.join(format!("{}_{}", ts, safe_filename));
     }
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        let mut file = fs::File::create(&local_temp_file).map_err(|e| e.to_string())?;
-        ftp_guard
-            .retr(&remote_path, |stream| {
-                std::io::copy(stream, &mut file)
-                    .map(|_| ())
-                    .map_err(suppaftp::FtpError::ConnectionError)
-            })
-            .map_err(|e| e.to_string())?;
+        let rpath = remote_path.clone();
+        let lfile = local_temp_file.clone();
+        tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&rpath)?;
+            let run_preview = |stream: &mut NativeTlsFtpStream| -> Result<(), String> {
+                if let Ok(sz) = stream.size(&rpath)
+                    && (sz as u64) > MAX_PREVIEW_BYTES
+                {
+                    return Err("Fichier trop volumineux (> 100 Mo) pour l'aperçu système. Utilisez le téléchargement standard.".to_string());
+                }
+                let mut file = fs::File::create(&lfile).map_err(|e| e.to_string())?;
+                let mut written: u64 = 0;
+                let mut chunk = [0u8; 64 * 1024];
+                use std::io::Write;
+                let res = stream.retr(&rpath, |data_stream| {
+                    loop {
+                        let n = data_stream
+                            .read(&mut chunk)
+                            .map_err(suppaftp::FtpError::ConnectionError)?;
+                        if n == 0 {
+                            break;
+                        }
+                        written += n as u64;
+                        if written > MAX_PREVIEW_BYTES {
+                            return Err(suppaftp::FtpError::ConnectionError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "PREVIEW_TOO_LARGE",
+                            )));
+                        }
+                        file.write_all(&chunk[..n])
+                            .map_err(suppaftp::FtpError::ConnectionError)?;
+                    }
+                    Ok(())
+                });
+                if let Err(e) = res {
+                    drop(file);
+                    let _ = fs::remove_file(&lfile);
+                    let msg = e.to_string();
+                    if msg.contains("PREVIEW_TOO_LARGE") {
+                        return Err("Fichier trop volumineux (> 100 Mo) pour l'aperçu système. Utilisez le téléchargement standard.".to_string());
+                    }
+                    return Err(msg);
+                }
+                Ok(())
+            };
+
+            if let Some(cfg) = ftp_cfg
+                && let Ok(mut dedicated) = acquire_ftp_transfer_conn(&ftp_pool, &cfg)
+            {
+                let res = run_preview(&mut dedicated);
+                release_ftp_transfer_conn(&ftp_pool, dedicated, res.is_ok());
+                return res;
+            }
+            let mut ftp_guard = ftp_arc
+                .lock()
+                .map_err(|_| "Verrou FTP corrompu".to_string())?;
+            run_preview(&mut ftp_guard)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     } else {
         let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
+        if let Ok(meta) = sftp.metadata(&remote_path).await
+            && meta.size.unwrap_or(0) > MAX_PREVIEW_BYTES
+        {
+            return Err("Fichier trop volumineux (> 100 Mo) pour l'aperçu système. Utilisez le téléchargement standard.".to_string());
+        }
         let mut remote_file = sftp.open(&remote_path).await.map_err(|e| e.to_string())?;
         let mut local_file = tokio::fs::File::create(&local_temp_file)
             .await
             .map_err(|e| e.to_string())?;
 
         let mut buffer = vec![0u8; 128 * 1024];
+        let mut written: u64 = 0;
         loop {
             let n = remote_file
                 .read(&mut buffer)
@@ -1828,11 +1231,18 @@ async fn open_remote_with_system(
             if n == 0 {
                 break;
             }
+            written += n as u64;
+            if written > MAX_PREVIEW_BYTES {
+                drop(local_file);
+                let _ = tokio::fs::remove_file(&local_temp_file).await;
+                return Err("Fichier trop volumineux (> 100 Mo) pour l'aperçu système. Utilisez le téléchargement standard.".to_string());
+            }
             local_file
                 .write_all(&buffer[..n])
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        local_file.flush().await.map_err(|e| e.to_string())?;
     }
 
     let path_str = local_temp_file.to_string_lossy().to_string();
@@ -1842,16 +1252,16 @@ async fn open_remote_with_system(
     Ok(path_str)
 }
 
-#[tauri::command]
-async fn exec_remote_command(
-    session_id: String,
-    command: String,
-    state: State<'_, AppState>,
+async fn exec_remote_command_inner(
+    session_id: &str,
+    command: &str,
+    state: &AppState,
 ) -> Result<String, String> {
+    ensure_valid_id(session_id, "de session")?;
     let ssh_arc = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
-            .get(&session_id)
+            .get(session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
 
         sess.ssh_session.clone().ok_or_else(|| {
@@ -1859,50 +1269,7 @@ async fn exec_remote_command(
         })?
     };
 
-    let mut channel = {
-        let session = ssh_arc.lock().await;
-        session
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("Impossible d'ouvrir un canal SSH : {}", e))?
-    };
-
-    channel
-        .exec(true, command.as_bytes())
-        .await
-        .map_err(|e| format!("Erreur exécution commande : {}", e))?;
-
-    let mut output = Vec::new();
-    let mut exit_status: Option<u32> = None;
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => {
-                output.extend_from_slice(data);
-            }
-            ChannelMsg::ExtendedData { ref data, .. } => {
-                output.extend_from_slice(data);
-            }
-            ChannelMsg::ExitStatus { exit_status: status } => {
-                exit_status = Some(status);
-            }
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
-    }
-
-    let out_str = String::from_utf8_lossy(&output).trim().to_string();
-    if let Some(status) = exit_status {
-        if status != 0 {
-            let msg = if out_str.is_empty() {
-                format!("Commande échouée avec le code de sortie {}", status)
-            } else {
-                format!("Échec (code {}): {}", status, out_str)
-            };
-            return Err(msg);
-        }
-    }
-
-    Ok(out_str)
+    sftp::exec_ssh_command(ssh_arc, command).await
 }
 
 #[tauri::command]
@@ -1912,37 +1279,46 @@ async fn chmod_remote(
     permissions: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        ftp_guard
-            .site(&format!("CHMOD {:o} {}", permissions, path))
-            .map_err(|e| format!("Erreur CHMOD FTP: {}", e))?;
-        return Ok(());
+        return tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&path)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                stream
+                    .site(format!("CHMOD {:o} {}", permissions & 0o7777, path))
+                    .map(|_| ())
+                    .map_err(|e| format!("Erreur CHMOD FTP: {}", e))
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
     let mut metadata = sftp.metadata(&path).await.map_err(|e| e.to_string())?;
     let old_mode = metadata.permissions.unwrap_or(0);
-    // Préserve les bits de type de fichier Unix (S_IFREG, S_IFDIR, etc.)
     let new_mode = (old_mode & !0o7777) | (permissions & 0o7777);
     metadata.permissions = Some(new_mode);
     sftp.set_metadata(&path, metadata)
         .await
         .map_err(|e| format!("Erreur CHMOD SFTP: {}", e))
-}
-
-#[tauri::command]
-fn rename_local(old_path: String, new_path: String) -> Result<(), String> {
-    fs::rename(old_path, new_path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1952,122 +1328,45 @@ async fn rename_remote(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&old_path) || !is_valid_remote_path(&new_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let new_name = remote_file_name(&new_path)
+        .ok_or_else(|| "Nom de destination invalide".to_string())?;
+    if !is_valid_remote_filename(new_name) {
+        return Err("Nom de destination distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        ftp_guard
-            .rename(&old_path, &new_path)
-            .map_err(|e| e.to_string())?;
-        return Ok(());
+        return tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&old_path)?;
+            validate_ftp_arg(&new_path)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                stream.rename(&old_path, &new_path).map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
     sftp.rename(old_path, new_path)
         .await
         .map_err(|e| e.to_string())
-}
-
-fn make_writable(path: &Path) {
-    if let Ok(metadata) = fs::metadata(path) {
-        let mut perms = metadata.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
-    }
-}
-
-#[tauri::command]
-fn delete_local(path: String, is_dir: bool) -> Result<(), String> {
-    let p = Path::new(&path);
-    if is_dir {
-        for entry in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
-            make_writable(entry.path());
-        }
-        make_writable(p);
-        fs::remove_dir_all(p).map_err(|e| e.to_string())
-    } else {
-        make_writable(p);
-        fs::remove_file(p).map_err(|e| e.to_string())
-    }
-}
-
-#[tauri::command]
-fn create_local_dir(path: String) -> Result<(), String> {
-    fs::create_dir_all(&path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn create_local_file(path: String) -> Result<(), String> {
-    if Path::new(&path).exists() {
-        return Err("Un élément portant ce nom existe déjà.".to_string());
-    }
-    fs::File::create(&path).map_err(|e| format!("Impossible de créer le fichier: {}", e))?;
-    Ok(())
-}
-
-async fn remove_dir_recursive_sftp(sftp: &SftpSession, root_path: &str) -> Result<(), String> {
-    fn delete_sftp_dir<'a>(
-        sftp: &'a SftpSession,
-        path: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            if let Ok(mut dir) = sftp.read_dir(path).await {
-                while let Some(item) = dir.next() {
-                    let name = item.file_name();
-                    if name == "." || name == ".." {
-                        continue;
-                    }
-                    let child_path = if path.ends_with('/') {
-                        format!("{}{}", path, name)
-                    } else {
-                        format!("{}/{}", path, name)
-                    };
-                    // Si c'est un lien symbolique, on ne descend SURTOUT PAS dedans pour ne pas
-                    // détruire récursivement la cible du lien ! On détache juste le lien.
-                    if item.file_type().is_symlink() {
-                        let _ = sftp.remove_file(&child_path).await;
-                    } else if item.file_type().is_dir() {
-                        delete_sftp_dir(sftp, &child_path).await?;
-                    } else {
-                        let _ = sftp.remove_file(&child_path).await;
-                    }
-                }
-            }
-            sftp.remove_dir(path).await.map_err(|e| e.to_string())
-        })
-    }
-    delete_sftp_dir(sftp, root_path).await
-}
-
-fn remove_dir_recursive_ftp(ftp: &mut NativeTlsFtpStream, path: &str) -> Result<(), String> {
-    let lines = match ftp.list(Some(path)) {
-        Ok(l) if !l.is_empty() => l,
-        _ => ftp.nlst(Some(path)).unwrap_or_default(),
-    };
-    for line in lines {
-        if let Some(entry) = parse_ftp_entry(&line, path) {
-            if entry.name == "." || entry.name == ".." {
-                continue;
-            }
-            if entry.is_dir {
-                let _ = remove_dir_recursive_ftp(ftp, &entry.path);
-            } else {
-                if ftp.rm(&entry.path).is_err() {
-                    let _ = remove_dir_recursive_ftp(ftp, &entry.path);
-                }
-            }
-        }
-    }
-    ftp.rmdir(path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2077,28 +1376,42 @@ async fn delete_remote(
     is_dir: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&path) || path == "/" {
+        return Err("Chemin distant invalide ou interdit".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        if is_dir {
-            remove_dir_recursive_ftp(&mut ftp_guard, &path)?;
-        } else {
-            ftp_guard.rm(&path).map_err(|e| e.to_string())?;
-        }
-        return Ok(());
+        return tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&path)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                if is_dir {
+                    ftp::remove_dir_recursive_ftp(stream, &path)
+                } else {
+                    stream.rm(&path).map_err(|e| e.to_string())
+                }
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
     if is_dir {
-        remove_dir_recursive_sftp(&sftp, &path).await
+        sftp::remove_dir_recursive_sftp(&sftp, &path).await
     } else {
         sftp.remove_file(&path).await.map_err(|e| e.to_string())
     }
@@ -2110,31 +1423,102 @@ async fn create_remote_dir(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let dir_name = remote_file_name(&path)
+        .ok_or_else(|| "Nom de dossier distant invalide".to_string())?;
+    if !is_valid_remote_filename(dir_name) {
+        return Err("Nom de dossier distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "FTP" || protocol == "FTPS" {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        ftp_guard.mkdir(&path).map_err(|e| e.to_string())?;
-        return Ok(());
+        return tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&path)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                stream.mkdir(&path).map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
     sftp.create_dir(&path).await.map_err(|e| e.to_string())
 }
 
-fn is_valid_remote_filename(s: &str) -> bool {
-    !s.is_empty() && !s.contains(['\0', '\n', '\r'])
-}
+#[tauri::command]
+async fn create_remote_file(
+    session_id: String,
+    remote_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let file_name = remote_file_name(&remote_path)
+        .ok_or_else(|| "Nom de fichier distant invalide".to_string())?;
+    if !is_valid_remote_filename(file_name) {
+        return Err("Nom de fichier distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
+        let sessions = state.sessions.lock().await;
+        let sess = sessions
+            .get(&session_id)
+            .ok_or_else(|| "Session inactive".to_string())?;
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
+    };
 
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    if protocol == "FTP" || protocol == "FTPS" {
+        let ftp_arc = ftp.ok_or_else(|| "Session FTP/FTPS inactive".to_string())?;
+        let rpath = remote_path.clone();
+        let fname = file_name.to_string();
+        return tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&rpath)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                if stream.size(&rpath).is_ok() {
+                    return Err("Un élément portant ce nom existe déjà.".to_string());
+                }
+                let parent = rpath.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }).unwrap_or("/");
+                if let Ok(entries) = ftp::list_entries_blocking(stream, parent)
+                    && entries.iter().any(|e| e.name.eq_ignore_ascii_case(&fname))
+                {
+                    return Err("Un élément portant ce nom existe déjà.".to_string());
+                }
+                let mut empty = std::io::Cursor::new(&[][..]);
+                stream.put_file(&rpath, &mut empty).map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let sftp = sftp.ok_or_else(|| "Session SFTP inactive".to_string())?;
+    if sftp.metadata(&remote_path).await.is_ok() {
+        return Err("Un élément portant ce nom existe déjà.".to_string());
+    }
+    sftp::save_text_sftp(&sftp, &remote_path, "").await
 }
 
 #[tauri::command]
@@ -2145,36 +1529,52 @@ async fn compress_remote(
     format: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    if !is_valid_remote_filename(&parent_dir) || !is_valid_remote_filename(&item_name) {
+    if !is_valid_remote_path(&parent_dir) || !is_valid_remote_filename(&item_name) {
         return Err("Caractères invalides ou chemin vide détecté".into());
+    }
+    if format != "zip" && format != "tar.gz" {
+        return Err("Format d'archive non supporté".into());
     }
 
     let parent_esc = shell_escape(&parent_dir);
-    let item_esc = shell_escape(&item_name);
+    let item_rel_esc = shell_escape(&format!("./{}", item_name));
 
     let (archive_name, cmd) = if format == "zip" {
         let zip_name = format!("{}.zip", item_name);
-        let zip_esc = shell_escape(&zip_name);
+        let zip_esc = shell_escape(&format!("./{}", zip_name));
         (
             zip_name,
-            format!(
-                "cd {} && zip -r -- {} {}",
-                parent_esc, zip_esc, item_esc
-            ),
+            format!("cd -- {} && zip -r -- {} {}", parent_esc, zip_esc, item_rel_esc),
         )
     } else {
         let tar_name = format!("{}.tar.gz", item_name);
-        let tar_esc = shell_escape(&tar_name);
+        let tar_esc = shell_escape(&format!("./{}", tar_name));
         (
             tar_name,
-            format!(
-                "cd {} && tar -czf {} -- {}",
-                parent_esc, tar_esc, item_esc
-            ),
+            format!("cd -- {} && tar -czf {} -- {}", parent_esc, tar_esc, item_rel_esc),
         )
     };
-    exec_remote_command(session_id, cmd, state).await?;
+    exec_remote_command_inner(&session_id, &cmd, &state).await?;
     Ok(archive_name)
+}
+
+fn extract_unzip_l_entry_name(trimmed: &str) -> Option<&str> {
+    let mut space_groups = 0usize;
+    let mut in_ws = false;
+    for (idx, ch) in trimmed.char_indices() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                space_groups += 1;
+                in_ws = true;
+            }
+        } else if in_ws {
+            in_ws = false;
+            if space_groups == 3 {
+                return Some(&trimmed[idx..]);
+            }
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -2184,29 +1584,121 @@ async fn extract_remote(
     archive_name: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    if !is_valid_remote_filename(&parent_dir) || !is_valid_remote_filename(&archive_name) {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&parent_dir) || !is_valid_remote_filename(&archive_name) {
         return Err("Caractères invalides ou nom d'archive vide détecté".into());
     }
 
     let parent_esc = shell_escape(&parent_dir);
-    let archive_esc = shell_escape(&archive_name);
+    let archive_rel_esc = shell_escape(&format!("./{}", archive_name));
 
     let cmd = if archive_name.ends_with(".zip") {
-        format!("cd {} && unzip -o -- {}", parent_esc, archive_esc)
-    } else if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-        format!("cd {} && tar -xzf {} -C {}", parent_esc, archive_esc, parent_esc)
-    } else if archive_name.ends_with(".tar") {
-        format!("cd {} && tar -xf {} -C {}", parent_esc, archive_esc, parent_esc)
+        // Pré-vérification anti Zip-Slip & symlinks avant extraction
+        let list_cmd = format!(
+            "cd -- {} && (unzip -Z1 -- {} 2>/dev/null || unzip -l -- {})",
+            parent_esc, archive_rel_esc, archive_rel_esc
+        );
+        let listing = exec_remote_command_inner(&session_id, &list_cmd, &state).await?;
+        let mut parsed_any = false;
+        let mut saw_header_sep = false;
+        let mut finished_table = false;
+        for line in listing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("Archive:") || trimmed.starts_with("Length") {
+                continue;
+            }
+            if trimmed.starts_with("----") {
+                if !saw_header_sep {
+                    saw_header_sep = true;
+                } else {
+                    finished_table = true;
+                }
+                continue;
+            }
+            if finished_table {
+                continue;
+            }
+            // Format `unzip -l` : "  1234  2026-01-01 12:00   dir/file.txt"
+            let entry_name = if saw_header_sep {
+                match extract_unzip_l_entry_name(trimmed) {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else {
+                trimmed
+            };
+            parsed_any = true;
+            if !local::is_safe_archive_entry(entry_name) {
+                return Err(format!(
+                    "Archive ZIP distante bloquée (chemin non sûr détecté : {})",
+                    entry_name
+                ));
+            }
+        }
+        if !parsed_any {
+            return Err("Impossible d'inspecter le contenu de l'archive ZIP distante.".to_string());
+        }
+        let zlist = exec_remote_command_inner(
+            &session_id,
+            &format!("cd -- {} && unzip -Z -- {}", parent_esc, archive_rel_esc),
+            &state,
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Archive ZIP distante bloquée (impossible de vérifier les liens symboliques via unzip -Z : {})",
+                e
+            )
+        })?;
+        for line in zlist.lines() {
+            let t = line.trim_start();
+            if t.starts_with('l') || t.starts_with('h') {
+                return Err(format!(
+                    "Archive ZIP distante bloquée (lien détecté : {})",
+                    t
+                ));
+            }
+        }
+        format!("cd -- {} && unzip -o -- {}", parent_esc, archive_rel_esc)
+    } else if archive_name.ends_with(".tar.gz")
+        || archive_name.ends_with(".tgz")
+        || archive_name.ends_with(".tar")
+    {
+        let flag = if archive_name.ends_with(".tar") { "t" } else { "tz" };
+        let list_cmd = format!("cd -- {} && tar -{}f {}", parent_esc, flag, archive_rel_esc);
+        let listing = exec_remote_command_inner(&session_id, &list_cmd, &state).await?;
+        for line in listing.lines() {
+            if !line.trim().is_empty() && !local::is_safe_archive_entry(line) {
+                return Err(format!(
+                    "Archive distante bloquée (chemin non sûr détecté : {})",
+                    line.trim()
+                ));
+            }
+        }
+        let vflag = if archive_name.ends_with(".tar") { "tv" } else { "tzv" };
+        let vlist_cmd = format!("cd -- {} && tar -{}f {}", parent_esc, vflag, archive_rel_esc);
+        let vlisting = exec_remote_command_inner(&session_id, &vlist_cmd, &state).await?;
+        for line in vlisting.lines() {
+            if !local::is_safe_tar_verbose_line(line) {
+                return Err(format!(
+                    "Archive distante bloquée (lien ou fichier spécial détecté : {})",
+                    line.trim()
+                ));
+            }
+        }
+        let xflag = if archive_name.ends_with(".tar") { "-xf" } else { "-xzf" };
+        format!(
+            "cd -- {} && tar {} {} -C {}",
+            parent_esc, xflag, archive_rel_esc, parent_esc
+        )
     } else {
         return Err("Format d'archive non supporté".into());
     };
-    exec_remote_command(session_id, cmd, state).await?;
+    exec_remote_command_inner(&session_id, &cmd, &state).await?;
     Ok("Archive extraite avec succès".into())
-}
-
-#[tauri::command]
-fn is_local_dir(path: String) -> bool {
-    Path::new(&path).is_dir()
 }
 
 #[tauri::command]
@@ -2215,12 +1707,21 @@ async fn get_remote_size(
     remote_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let (protocol, sftp, ftp) = {
+    ensure_valid_id(&session_id, "de session")?;
+    if !is_valid_remote_path(&remote_path) {
+        return Err("Chemin distant invalide".to_string());
+    }
+    let (protocol, sftp, ftp, ftp_cfg) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
             .ok_or_else(|| "Session inactive".to_string())?;
-        (sess.protocol.clone(), sess.sftp.clone(), sess.ftp.clone())
+        (
+            sess.protocol.clone(),
+            sess.sftp.clone(),
+            sess.ftp.clone(),
+            sess.ftp_config.clone(),
+        )
     };
 
     if protocol == "SFTP" {
@@ -2229,117 +1730,55 @@ async fn get_remote_size(
         if meta.is_dir() {
             let esc_path = shell_escape(&remote_path);
             let cmd = format!("du -sh -- {}", esc_path);
-            let raw_res = exec_remote_command(session_id, cmd, state).await?;
-            let size_only = raw_res.split_whitespace().next().unwrap_or(&raw_res).to_string();
+            let raw_res = exec_remote_command_inner(&session_id, &cmd, &state).await?;
+            let size_only = raw_res
+                .split_whitespace()
+                .next()
+                .unwrap_or(&raw_res)
+                .to_string();
             Ok(size_only)
         } else {
-            let bytes = meta.size.unwrap_or(0);
-            if bytes > 1024 * 1024 * 1024 {
-                Ok(format!("{:.2} Go", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
-            } else if bytes > 1024 * 1024 {
-                Ok(format!("{:.1} Mo", bytes as f64 / (1024.0 * 1024.0)))
-            } else if bytes > 1024 {
-                Ok(format!("{:.0} Ko", bytes as f64 / 1024.0))
-            } else {
-                Ok(format!("{} octets", bytes))
-            }
+            Ok(format_size_human(meta.size.unwrap_or(0)))
         }
     } else {
         let ftp_arc = ftp.ok_or_else(|| "Session FTP inactive".to_string())?;
-        let mut ftp_guard = ftp_arc.lock().await;
-        let size = ftp_guard.size(&remote_path).map_err(|e| e.to_string())? as u64;
-        if size > 1024 * 1024 {
-            Ok(format!("{:.1} Mo", size as f64 / (1024.0 * 1024.0)))
-        } else if size > 1024 {
-            Ok(format!("{:.0} Ko", size as f64 / 1024.0))
-        } else {
-            Ok(format!("{} octets", size))
-        }
-    }
-}
-
-#[tauri::command]
-async fn compress_local(path: String, format: String) -> Result<String, String> {
-    let p = Path::new(&path);
-    let name = p.file_name().ok_or("Chemin invalide")?.to_string_lossy().to_string();
-    let parent = p.parent().unwrap_or(Path::new("."));
-    let is_zip = format.to_lowercase() == "zip";
-    let ext = if is_zip { "zip" } else { "tar.gz" };
-    let archive_path = parent.join(format!("{}.{}", name, ext));
-    let archive_str = archive_path.to_string_lossy().to_string();
-
-    let output = tokio::process::Command::new("tar")
-        .current_dir(parent)
-        .args(["-acf", &archive_str, &name])
-        .output()
+        let size = tokio::task::spawn_blocking(move || {
+            validate_ftp_arg(&remote_path)?;
+            run_ftp_browsing(&ftp_arc, &ftp_cfg, |stream| {
+                stream
+                    .size(&remote_path)
+                    .map(|s| s as u64)
+                    .map_err(|e| e.to_string())
+            })
+        })
         .await
-        .map_err(|e| format!("Erreur exécution tar: {}", e))?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        .map_err(|e| e.to_string())??;
+        Ok(format_size_human(size))
     }
-    Ok(archive_str)
 }
 
-#[tauri::command]
-async fn extract_local(path: String) -> Result<String, String> {
-    let p = Path::new(&path);
-    let parent = p.parent().unwrap_or(Path::new("."));
-
-    let output = tokio::process::Command::new("tar")
-        .current_dir(parent)
-        .args(["-axf", &path])
-        .output()
-        .await
-        .map_err(|e| format!("Erreur exécution tar: {}", e))?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+fn format_size_human(bytes: u64) -> String {
+    if bytes > 1024 * 1024 * 1024 {
+        format!("{:.2} Go", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes > 1024 * 1024 {
+        format!("{:.1} Mo", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes > 1024 {
+        format!("{:.0} Ko", bytes as f64 / 1024.0)
+    } else {
+        format!("{} octets", bytes)
     }
-    Ok("Archive locale extraite".into())
 }
 
-#[tauri::command]
-fn get_temp_dir() -> String {
-    let temp = std::env::temp_dir().join("Gens-RFT").join("relay");
-    let _ = fs::create_dir_all(&temp);
-    temp.to_string_lossy().to_string()
-}
-
-#[tauri::command]
-fn export_sites_to_path(file_path: String, json_content: String) -> Result<(), String> {
-    fs::write(file_path, json_content)
-        .map_err(|e| format!("Impossible d'écrire le fichier : {}", e))
-}
-
-fn dirs_next() -> Option<PathBuf> {
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let path = PathBuf::from(userprofile);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-
-    if let (Ok(drive), Ok(homepath)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
-        let path = PathBuf::from(format!("{}{}", drive, homepath));
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-
-    std::env::current_dir().ok()
+fn cleanup_temp_workspace() {
+    let base = local::pid_temp_root();
+    let _ = fs::remove_dir_all(base);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    cleanup_temp_workspace();
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -2347,11 +1786,11 @@ pub fn run() {
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
-            get_windows_drives,
-            get_system_folders,
-            read_local_dir,
+            local::get_windows_drives,
+            local::get_system_folders,
+            local::read_local_dir,
             list_remote_subdirs,
-            read_local_subdirs,
+            local::read_local_subdirs,
             connect_server,
             disconnect_server,
             start_ssh_pty,
@@ -2364,24 +1803,182 @@ pub fn run() {
             read_remote_file_text,
             save_remote_file_text,
             open_remote_with_system,
-            exec_remote_command,
-            delete_local,
-            create_local_dir,
-            create_local_file,
+            local::delete_local,
+            local::create_local_dir,
+            local::create_local_file,
             delete_remote,
             create_remote_dir,
-            rename_local,
+            create_remote_file,
+            local::rename_local,
             rename_remote,
             chmod_remote,
             compress_remote,
             extract_remote,
-            compress_local,
-            extract_local,
-            is_local_dir,
+            local::compress_local,
+            local::extract_local,
+            local::is_local_dir,
             get_remote_size,
-            export_sites_to_path,
-            get_temp_dir
+            local::export_sites_to_path,
+            local::get_temp_dir,
+            security::read_legacy_vault_key_if_exists,
+            security::delete_legacy_vault_key,
+            security::load_vault_sites,
+            security::save_vault_sites
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let RunEvent::Exit = event {
+            let state = app_handle.state::<AppState>();
+            tauri::async_runtime::block_on(async {
+                state.cancel_all().await;
+                let drained: Vec<ServerSession> = {
+                    let mut sessions = state.sessions.lock().await;
+                    sessions.drain().map(|(_, s)| s).collect()
+                };
+                for sess in drained {
+                    cleanup_session_resources(sess).await;
+                }
+            });
+            cleanup_temp_workspace();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_windows_filename() {
+        assert_eq!(sanitize_windows_filename("CON"), "_CON");
+        assert_eq!(sanitize_windows_filename("CONIN$"), "_CONIN$");
+        assert_eq!(sanitize_windows_filename("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_windows_filename(".."), "unnamed_file");
+        assert_eq!(sanitize_windows_filename("...  "), "unnamed_file");
+        assert_eq!(sanitize_windows_filename("a<b>c:d/e\\f|g?h*i"), "a_b_c_d_e_f_g_h_i");
+        assert_eq!(sanitize_windows_filename("hello\x07\nworld"), "hello__world");
+    }
+
+    #[test]
+    fn test_ftp_entry_parsing_and_traversal_defense() {
+        let unix_line = "drwxr-xr-x 2 user group 4096 Nov 09 10:00 my  folder";
+        let parsed = ftp::parse_ftp_entry(unix_line, "/var").unwrap();
+        assert_eq!(parsed.name, "my  folder");
+        assert!(parsed.is_dir);
+        assert_eq!(parsed.path, "/var/my  folder");
+
+        // Rejet d'un nom contenant .. ou /
+        let malicious = "-rw-r--r-- 1 user group 123 Nov 09 10:00 ../../etc/passwd";
+        assert!(ftp::parse_ftp_entry(malicious, "/var").is_none());
+
+        let dos_line = "01-02-23 04:50PM <DIR> logs";
+        let dos_parsed = ftp::parse_ftp_entry(dos_line, "/").unwrap();
+        assert_eq!(dos_parsed.name, "logs");
+        assert!(dos_parsed.is_dir);
+    }
+
+    #[test]
+    fn test_validation_and_shell_escape() {
+        assert!(validate_ftp_arg("/var/www/index.html").is_ok());
+        assert!(validate_ftp_arg("/var/www\r\nDELE /etc/passwd").is_err());
+        assert!(is_valid_remote_filename("archive.tar.gz"));
+        assert!(!is_valid_remote_filename("../secret"));
+        assert!(!is_valid_remote_filename("a/b"));
+        assert!(!is_valid_remote_filename("bad\x01name"));
+        assert!(is_valid_remote_path("/var/www/site"));
+        assert!(!is_valid_remote_path("/var/www\nrm -rf /"));
+        assert_eq!(shell_escape("it's a file"), "'it'\\''s a file'");
+    }
+
+    #[test]
+    fn test_id_and_local_filename_and_archive_entry_validation() {
+        assert!(is_valid_id("tab_1"));
+        assert!(is_valid_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("../evil"));
+        assert!(!is_valid_id("tab/1"));
+
+        assert!(security::is_valid_local_filename("rapport-2026.pdf"));
+        assert!(!security::is_valid_local_filename(".."));
+        assert!(!security::is_valid_local_filename("sub/file.txt"));
+        assert!(!security::is_valid_local_filename("sub\\file.txt"));
+        assert!(!security::is_valid_local_filename("CON"));
+        assert!(!security::is_valid_local_filename("file."));
+
+        assert!(local::is_safe_archive_entry("dir/file.txt"));
+        assert!(local::is_safe_archive_entry("./dir/file.txt"));
+        assert!(!local::is_safe_archive_entry("../evil.txt"));
+        assert!(!local::is_safe_archive_entry("dir/../../evil.txt"));
+        assert!(!local::is_safe_archive_entry("/etc/passwd"));
+        assert!(!local::is_safe_archive_entry("C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    #[test]
+    fn test_zeroize_bytes() {
+        let mut secret = vec![0xAAu8; 32];
+        security::zeroize_bytes(&mut secret);
+        assert!(secret.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_aes256_gcm_vault_roundtrip() {
+        let key = [0x42u8; 32];
+        let nonce = [0x11u8; 12];
+        let payload = br#"[{"id":"1","password":"secret"}]"#;
+        let encrypted = security::encrypt_vault_aes256_gcm(&key, &nonce, payload).unwrap();
+        assert_ne!(&encrypted[12..], payload);
+        let decrypted = security::decrypt_vault_aes256_gcm(&key, &encrypted).unwrap();
+        assert_eq!(&decrypted[..], payload);
+
+        let wrong_key = [0x99u8; 32];
+        assert!(security::decrypt_vault_aes256_gcm(&wrong_key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn test_safe_local_delete_and_tar_verbose_and_ipv6() {
+        assert!(!security::is_safe_local_delete_target(Path::new("C:")));
+        assert!(!security::is_safe_local_delete_target(Path::new("C:\\")));
+        assert!(!security::is_safe_local_delete_target(Path::new("C:\\Users\\..")));
+        assert!(!security::is_safe_local_delete_target(Path::new("/")));
+        assert!(security::is_safe_local_delete_target(Path::new("C:\\Users\\test\\file.txt")));
+
+        assert!(local::is_safe_tar_verbose_line("-rw-r--r-- 0 user group 100 Jan 1 00:00 normal.txt"));
+        assert!(local::is_safe_tar_verbose_line("drwxr-xr-x 0 user group 0 Jan 1 00:00 subdir"));
+        assert!(!local::is_safe_tar_verbose_line("lrwxrwxrwx 0 user group 0 Jan 1 00:00 evil -> /etc/passwd"));
+        assert!(!local::is_safe_tar_verbose_line("hrw-r--r-- 0 user group 0 Jan 1 00:00 evil link to C:\\Windows\\win.ini"));
+        assert!(!local::is_safe_tar_verbose_line("crw-rw-rw- 0 root root 1, 3 Jan 1 00:00 null"));
+
+        assert_eq!(security::remote_file_name("/var/www/index.html"), Some("index.html"));
+        assert_eq!(security::remote_file_name("/var/www/..\\evil"), Some("..\\evil"));
+        assert!(!security::is_valid_remote_filename("..\\evil"));
+        assert_eq!(security::remote_file_name("/"), None);
+
+        let mut used = std::collections::HashSet::new();
+        let p1 = security::unique_local_child_path(Path::new("dest"), "Report.txt", &mut used);
+        let p2 = security::unique_local_child_path(Path::new("dest"), "report.txt", &mut used);
+        assert_ne!(p1.to_string_lossy().to_lowercase(), p2.to_string_lossy().to_lowercase());
+
+        assert_eq!(ftp::format_host_port("::1", 21), "[::1]:21");
+        assert_eq!(ftp::format_host_port("[::1]", 21), "[::1]:21");
+        assert_eq!(ftp::format_host_port("192.168.1.10", 21), "192.168.1.10:21");
+    }
+
+    #[test]
+    fn test_executable_after_sanitize_and_ads_and_unzip_parser() {
+        assert!(security::is_dangerous_executable_filename("payload.exe "));
+        assert!(security::is_dangerous_executable_filename("payload.exe."));
+        assert!(security::is_dangerous_executable_filename("connect.rdp"));
+        assert!(!security::is_dangerous_executable_filename("readme.txt"));
+
+        assert!(!local::is_safe_archive_entry("readme.txt:evil.exe"));
+        assert!(!security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\..\\Windows")));
+        assert!(security::is_safe_local_path_no_traversal(Path::new("C:\\Users\\test\\docs")));
+
+        assert_eq!(
+            extract_unzip_l_entry_name("1234  2026-01-01 12:00   dir/my file.txt"),
+            Some("dir/my file.txt")
+        );
+    }
 }

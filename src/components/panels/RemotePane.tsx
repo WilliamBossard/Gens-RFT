@@ -1,5 +1,6 @@
-import React, { useRef } from "react";
+import React, { useRef, useMemo, useEffect, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Server,
   Star,
@@ -17,7 +18,14 @@ import {
 } from "lucide-react";
 import DirectoryTree from "../../DirectoryTree";
 import { FileEntry, SortField, SortOrder, TabSession } from "../../types";
-import { getFileBadge, formatFileSize, formatOctalPermissions } from "../../utils/fileHelpers";
+import {
+  getFileBadge,
+  formatFileSize,
+  formatOctalPermissions,
+  isDangerousExecutable,
+  isValidFilenameInput,
+  joinRemotePath,
+} from "../../utils/fileHelpers";
 
 interface Props {
   isDark: boolean;
@@ -71,10 +79,15 @@ interface Props {
     value: string;
     onConfirm: (val: string) => void;
   }) => void;
+  onPromptConfirmModal: (modal: {
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  }) => void;
   logMessage: (msg: string) => void;
 }
 
-export default function RemotePane({
+function RemotePaneComponent({
   isDark,
   localPaneWidth,
   setLocalPaneWidth,
@@ -114,10 +127,31 @@ export default function RemotePane({
   onCheckAndEnqueueTransfer,
   onOpenContextMenu,
   onPromptInputModal,
+  onPromptConfirmModal,
   logMessage,
 }: Props) {
   const bookmarksRef = useRef<HTMLDivElement>(null);
   const lastSelectedRemoteIndexRef = useRef<number | null>(null);
+  const listParentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    lastSelectedRemoteIndexRef.current = null;
+  }, [activeTab.id, activeTab.remotePath]);
+
+  const remoteSubFolders = useMemo(
+    () =>
+      activeTab.remoteFiles
+        .filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith(".")))
+        .map((f) => f.name),
+    [activeTab.remoteFiles, showHidden]
+  );
+
+  const rowVirtualizer = useVirtualizer({
+    count: activeTab.isConnected ? processedRemoteFiles.length : 0,
+    getScrollElement: () => listParentRef.current,
+    estimateSize: () => 30,
+    overscan: 12,
+  });
 
   const currentRemoteIndex = activeTab.remoteHistoryIndex ?? 0;
   const currentRemoteHistory = activeTab.remoteHistory || ["/"];
@@ -188,29 +222,6 @@ export default function RemotePane({
               );
             }
             setDraggedItem(null);
-          } else if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-            if (!activeTab.isConnected) {
-              logMessage("Erreur : Impossible d'envoyer des fichiers, serveur déconnecté.");
-              return;
-            }
-            const dropFiles = Array.from(e.dataTransfer.files);
-            let count = 0;
-            for (const file of dropFiles) {
-              const filePath = (file as any).path || (file as any).webkitRelativePath || "";
-              if (filePath) {
-                onCheckAndEnqueueTransfer(
-                  file.name,
-                  filePath,
-                  activeTab.remotePath,
-                  "upload",
-                  false
-                );
-                count++;
-              }
-            }
-            if (count > 0) {
-              logMessage(`Glisser-déposer externe : ${count} fichier(s) ajouté(s) à la file d'attente.`);
-            }
           }
         }}
         className={`flex flex-col relative transition ${
@@ -393,13 +404,17 @@ export default function RemotePane({
                       onConfirm: async (val) => {
                         const dirName = val.trim();
                         if (!dirName) return;
-                        const sep = activeTab.remotePath.endsWith("/") ? "" : "/";
+                        if (!isValidFilenameInput(dirName, true)) {
+                          logMessage("Nom de dossier distant invalide (caractères interdits ou '..').");
+                          return;
+                        }
+                        const target = joinRemotePath(activeTab.remotePath, dirName);
                         try {
                           await invoke("create_remote_dir", {
                             sessionId: activeTab.id,
-                            path: `${activeTab.remotePath}${sep}${dirName}`,
+                            path: target,
                           });
-                          logMessage(`MKD ${activeTab.remotePath}${sep}${dirName}`);
+                          logMessage(`MKD ${target}`);
                           onNavigateRemote(activeTab.remotePath);
                         } catch (err) {
                           logMessage(`550 Échec création dossier distant : ${err}`);
@@ -432,7 +447,7 @@ export default function RemotePane({
                   isDark={isDark}
                   isRemote={true}
                   currentPath={activeTab.remotePath}
-                  subFolders={activeTab.remoteFiles.filter((f) => f.is_dir && (showHidden ? true : !f.name.startsWith("."))).map((f) => f.name)}
+                  subFolders={remoteSubFolders}
                   onNavigate={onNavigateRemote}
                 />
               ) : (
@@ -494,8 +509,9 @@ export default function RemotePane({
           <span className="col-span-1 text-center">Action</span>
         </div>
 
-        {/* Liste des fichiers distants */}
+        {/* Liste des fichiers distants virtualisée */}
         <div
+          ref={listParentRef}
           onClick={() => {
             setActivePane("remote");
             setSelectedRemotePaths(new Set());
@@ -506,7 +522,7 @@ export default function RemotePane({
             setActivePane("remote");
             onOpenContextMenu(e, null, true);
           }}
-          className="flex-1 overflow-y-auto font-mono text-xs divide-y divide-neutral-500/10 min-h-[100px]"
+          className="flex-1 overflow-y-auto font-mono text-xs min-h-[100px]"
         >
           {!activeTab.isConnected ? (
             <div className="flex h-full flex-col items-center justify-center text-xs text-neutral-500 gap-2 font-sans">
@@ -514,129 +530,176 @@ export default function RemotePane({
               <span>Absence de connexion à un serveur</span>
             </div>
           ) : (
-            processedRemoteFiles.map((item, index) => {
-              const badge = getFileBadge(item.name, isDark);
-              const isSelected = selectedRemotePaths.has(item.path);
-              return (
-                <div
-                  key={item.path}
-                  draggable
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActivePane("remote");
-                    if (e.shiftKey && lastSelectedRemoteIndexRef.current !== null) {
-                      const start = Math.min(lastSelectedRemoteIndexRef.current, index);
-                      const end = Math.max(lastSelectedRemoteIndexRef.current, index);
-                      const rangePaths = processedRemoteFiles.slice(start, end + 1).map((f) => f.path);
-                      setSelectedRemotePaths(new Set(rangePaths));
-                    } else if (e.ctrlKey || e.metaKey) {
-                      lastSelectedRemoteIndexRef.current = index;
-                      setSelectedRemotePaths((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(item.path)) next.delete(item.path);
-                        else next.add(item.path);
-                        return next;
-                      });
-                    } else {
-                      lastSelectedRemoteIndexRef.current = index;
-                      setSelectedRemotePaths(new Set([item.path]));
-                    }
-                  }}
-                  onDragStart={(e) => {
-                    setDraggedItem({ entry: item, from: "remote", fromSessionId: activeTab.id });
-                    e.dataTransfer.setData("text/plain", item.path);
-                    e.dataTransfer.effectAllowed = "copyMove";
-                  }}
-                  onDragEnd={() => {
-                    setDraggedItem(null);
-                    setIsOverRemote(false);
-                    setIsOverLocal(false);
-                    setDragOverTabId(null);
-                  }}
-                  onDoubleClick={() => {
-                    if (item.is_dir) {
-                      onNavigateRemote(item.path);
-                    } else {
-                      onCheckAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
-                    }
-                  }}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setActivePane("remote");
-                    if (!selectedRemotePaths.has(item.path)) {
-                      setSelectedRemotePaths(new Set([item.path]));
-                    }
-                    onOpenContextMenu(e, item, true);
-                  }}
-                  className={`grid grid-cols-12 items-center px-3 py-1.5 cursor-pointer group transition duration-75 border-l-2 select-none ${
-                    isSelected
-                      ? isDark
-                        ? "bg-sky-500/20 border-sky-400 font-medium"
-                        : "bg-sky-100 border-sky-600 font-medium"
-                      : "border-transparent hover:bg-sky-500/10"
-                  }`}
-                >
-                  <div className="col-span-6 flex items-center gap-2 truncate pr-2">
-                    {item.is_dir ? (
-                      <Folder className="h-4 w-4 text-sky-500 shrink-0" />
-                    ) : (
-                      badge.icon
-                    )}
-                    <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
-                      {item.name}
-                    </span>
-                  </div>
+            <div
+              style={{
+                height: `${rowVirtualizer.getTotalSize()}px`,
+                width: "100%",
+                position: "relative",
+              }}
+            >
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const index = virtualRow.index;
+                const item = processedRemoteFiles[index];
+                const badge = getFileBadge(item.name, isDark);
+                const isSelected = selectedRemotePaths.has(item.path);
+                return (
+                  <div
+                    key={item.path}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      height: `${virtualRow.size}px`,
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                    draggable
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActivePane("remote");
+                      if (e.shiftKey && lastSelectedRemoteIndexRef.current !== null) {
+                        const start = Math.min(lastSelectedRemoteIndexRef.current, index);
+                        const end = Math.max(lastSelectedRemoteIndexRef.current, index);
+                        const rangePaths = processedRemoteFiles.slice(start, end + 1).map((f) => f.path);
+                        setSelectedRemotePaths(new Set(rangePaths));
+                      } else if (e.ctrlKey || e.metaKey) {
+                        lastSelectedRemoteIndexRef.current = index;
+                        setSelectedRemotePaths((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(item.path)) next.delete(item.path);
+                          else next.add(item.path);
+                          return next;
+                        });
+                      } else {
+                        lastSelectedRemoteIndexRef.current = index;
+                        setSelectedRemotePaths(new Set([item.path]));
+                      }
+                    }}
+                    onDragStart={(e) => {
+                      setDraggedItem({ entry: item, from: "remote", fromSessionId: activeTab.id });
+                      e.dataTransfer.setData("text/plain", item.path);
+                      e.dataTransfer.effectAllowed = "copyMove";
+                    }}
+                    onDragEnd={() => {
+                      setDraggedItem(null);
+                      setIsOverRemote(false);
+                      setIsOverLocal(false);
+                      setDragOverTabId(null);
+                    }}
+                    onDoubleClick={() => {
+                      if (item.is_dir) {
+                        onNavigateRemote(item.path);
+                      } else {
+                        onCheckAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setActivePane("remote");
+                      if (!selectedRemotePaths.has(item.path)) {
+                        setSelectedRemotePaths(new Set([item.path]));
+                      }
+                      onOpenContextMenu(e, item, true);
+                    }}
+                    className={`grid grid-cols-12 items-center px-3 py-1.5 border-b border-neutral-500/10 cursor-pointer group transition duration-75 border-l-2 select-none ${
+                      isSelected
+                        ? isDark
+                          ? "bg-sky-500/20 border-l-sky-400 font-medium"
+                          : "bg-sky-100 border-l-sky-600 font-medium"
+                        : "border-l-transparent hover:bg-sky-500/10"
+                    }`}
+                  >
+                    <div className="col-span-6 flex items-center gap-2 truncate pr-2">
+                      {item.is_dir ? (
+                        <Folder className="h-4 w-4 text-sky-500 shrink-0" />
+                      ) : (
+                        badge.icon
+                      )}
+                      <span className={`truncate ${item.is_dir ? (isDark ? "text-neutral-200" : "text-neutral-900 font-semibold") : badge.color}`}>
+                        {item.name}
+                      </span>
+                    </div>
 
-                  <div className="col-span-2 text-center text-[10px] text-neutral-500 font-mono hidden sm:inline">
-                    {formatOctalPermissions(item.permissions)}
-                  </div>
+                    <div className="col-span-2 text-center text-[10px] text-neutral-500 font-mono hidden sm:inline">
+                      {formatOctalPermissions(item.permissions)}
+                    </div>
 
-                  <div className="col-span-5 sm:col-span-3 text-right text-[11px] text-neutral-500 font-sans">
-                    {!item.is_dir ? formatFileSize(item.size) : "--"}
-                  </div>
+                    <div className="col-span-5 sm:col-span-3 text-right text-[11px] text-neutral-500 font-sans">
+                      {!item.is_dir ? formatFileSize(item.size) : "--"}
+                    </div>
 
-                  <div className="col-span-1 flex justify-center gap-1">
-                    {!item.is_dir && (
-                      <>
-                        <button
-                          onClick={async (e) => {
-                            e.stopPropagation();
-                            logMessage(`Téléchargement temporaire et ouverture de "${item.name}"...`);
-                            try {
-                              const tempPath = await invoke<string>("open_remote_with_system", {
-                                sessionId: activeTab.id,
-                                remotePath: item.path,
-                              });
-                              logMessage(`Fichier ouvert : ${tempPath}`);
-                            } catch (err) {
-                              logMessage(`Erreur d'ouverture : ${err}`);
-                            }
-                          }}
-                          className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-amber-400 cursor-pointer transition active:scale-95"
-                          title="Ouvrir avec le programme par défaut de Windows"
-                        >
-                          <ExternalLink className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onCheckAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
-                          }}
-                          className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-emerald-500 cursor-pointer transition active:scale-95"
-                          title="Télécharger"
-                        >
-                          <Download className="h-3.5 w-3.5" />
-                        </button>
-                      </>
-                    )}
+                    <div className="col-span-1 flex justify-center gap-1">
+                      {!item.is_dir && (
+                        <>
+                          <button
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              const performOpen = async (confirmExec: boolean) => {
+                                logMessage(`Téléchargement temporaire et ouverture de "${item.name}"...`);
+                                try {
+                                  const tempPath = await invoke<string>("open_remote_with_system", {
+                                    sessionId: activeTab.id,
+                                    remotePath: item.path,
+                                    confirmExecutable: confirmExec,
+                                  });
+                                  logMessage(`Fichier ouvert : ${tempPath}`);
+                                } catch (err) {
+                                  const errStr = String(err);
+                                  if (errStr.startsWith("EXECUTABLE_CONFIRM_REQUIRED|") && !confirmExec) {
+                                    const safeName = errStr.split("|")[1] || item.name;
+                                    onPromptConfirmModal({
+                                      title: "Avertissement de sécurité",
+                                      message: `"${safeName}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec le système ?`,
+                                      onConfirm: () => {
+                                        void performOpen(true);
+                                      },
+                                    });
+                                    return;
+                                  }
+                                  logMessage(`Erreur d'ouverture : ${err}`);
+                                }
+                              };
+
+                              if (isDangerousExecutable(item.name)) {
+                                onPromptConfirmModal({
+                                  title: "Avertissement de sécurité",
+                                  message: `"${item.name}" est un fichier exécutable ou script pouvant contenir du code malveillant. Êtes-vous sûr de vouloir le télécharger et l'exécuter avec le système ?`,
+                                  onConfirm: () => {
+                                    void performOpen(true);
+                                  },
+                                });
+                              } else {
+                                await performOpen(false);
+                              }
+                            }}
+                            className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-amber-400 cursor-pointer transition active:scale-95"
+                            title="Ouvrir avec le programme par défaut de Windows"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onCheckAndEnqueueTransfer(item.name, item.path, currentPath, "download", false);
+                            }}
+                            className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-emerald-500 cursor-pointer transition active:scale-95"
+                            title="Télécharger"
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
-                </div>
-              );
-            })
+                );
+              })}
+            </div>
           )}
         </div>
       </section>
     </>
   );
 }
+
+export default memo(RemotePaneComponent);
