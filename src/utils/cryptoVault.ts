@@ -299,34 +299,106 @@ export async function decryptVaultData<T = unknown>(
   }
 }
 
-export async function loadSitesFromBackendVault<T>(legacyStorageKey: string): Promise<T[]> {
-  const backendRaw = await invoke<string | null>("load_vault_sites");
-  if (backendRaw !== null) {
-    const parsed = JSON.parse(backendRaw);
-    if (!Array.isArray(parsed)) {
-      throw new Error("Format du coffre backend invalide.");
-    }
-    return parsed as T[];
+export interface SiteProfileSummary {
+  id: string;
+  name: string;
+  protocol: "SFTP" | "FTP" | "FTPS";
+  host: string;
+  port: string;
+  authType: "password" | "key";
+  username: string;
+  keyPath?: string;
+  lastRemotePath?: string;
+  lastLocalPath?: string;
+  acceptInvalidCerts?: boolean;
+  hasPassword: boolean;
+  hasPassphrase: boolean;
+}
+
+export interface SiteProfileSaveInput {
+  id: string;
+  name: string;
+  protocol: "SFTP" | "FTP" | "FTPS";
+  host: string;
+  port: string;
+  authType: "password" | "key";
+  username: string;
+  password?: string;
+  clearPassword: boolean;
+  keyPath?: string;
+  passphrase?: string;
+  clearPassphrase: boolean;
+  lastRemotePath?: string;
+  lastLocalPath?: string;
+  acceptInvalidCerts?: boolean;
+}
+
+export interface SiteSecretsPayload {
+  password: string;
+  passphrase: string;
+}
+
+export async function loadSitesFromBackendVault(
+  legacyStorageKey: string
+): Promise<SiteProfileSummary[]> {
+  const backendSummaries = await invoke<SiteProfileSummary[] | null>(
+    "load_vault_sites_summary"
+  );
+  if (backendSummaries !== null) {
+    return backendSummaries;
   }
 
   // Migration unique depuis l'ancien stockage localStorage (enc:v4:dpapi / legacy) vers le coffre Rust
   const legacyRaw = localStorage.getItem(legacyStorageKey);
   if (legacyRaw) {
-    const migrated = await decryptVaultDataStrict<T[]>(legacyRaw);
+    const migrated = await decryptVaultDataStrict<unknown[]>(legacyRaw);
     if (!Array.isArray(migrated)) {
       throw new Error("Format de profils migrés invalide.");
     }
-    await invoke("save_vault_sites", { jsonPayload: JSON.stringify(migrated) });
+    const summaries = await invoke<SiteProfileSummary[]>("import_vault_profiles", {
+      profilesJson: JSON.stringify(migrated),
+    });
     await invoke("delete_legacy_vault_key").catch(() => {});
     localStorage.removeItem(legacyStorageKey);
     localStorage.removeItem(VAULT_KEY_STORAGE);
     cachedDpapiKey = null;
-    return migrated;
+    return summaries;
   }
 
   return [];
 }
 
-export async function saveSitesToBackendVault(sites: unknown[]): Promise<void> {
-  await invoke("save_vault_sites", { jsonPayload: JSON.stringify(sites) });
+export async function saveSiteProfile(
+  input: SiteProfileSaveInput
+): Promise<SiteProfileSummary[]> {
+  return await invoke<SiteProfileSummary[]>("save_site_profile", { input });
+}
+
+export async function deleteSiteProfile(
+  siteId: string
+): Promise<SiteProfileSummary[]> {
+  return await invoke<SiteProfileSummary[]>("delete_site_profile", { siteId });
+}
+
+export async function importVaultProfiles(
+  profiles: unknown[]
+): Promise<SiteProfileSummary[]> {
+  return await invoke<SiteProfileSummary[]>("import_vault_profiles", {
+    profilesJson: JSON.stringify(profiles),
+  });
+}
+
+export async function getSiteSecretsForEdit(
+  siteId: string
+): Promise<SiteSecretsPayload> {
+  return await invoke<SiteSecretsPayload>("get_site_secrets_for_edit", {
+    siteId,
+  });
+}
+
+export async function exportVaultEncryptedToPath(
+  filePath: string,
+  exportPassword: string
+): Promise<void> {
+  await invoke("export_vault_encrypted_to_path", { filePath, exportPassword });
 }

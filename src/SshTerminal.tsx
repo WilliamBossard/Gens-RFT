@@ -18,12 +18,19 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const ptyStarted = useRef(false);
+  const listenersReadyRef = useRef(false);
+  const isConnectedRef = useRef(isConnected);
+  const protocolRef = useRef(protocol);
+  isConnectedRef.current = isConnected;
+  protocolRef.current = protocol;
   const [ptyClosed, setPtyClosed] = useState(false);
 
   const launchPty = useCallback(() => {
     const term = xtermInstance.current;
     const fitAddon = fitAddonRef.current;
-    if (!term || !fitAddon || !isConnected || protocol === "FTP" || protocol === "FTPS") return;
+    const connected = isConnectedRef.current;
+    const proto = protocolRef.current;
+    if (!term || !fitAddon || !connected || proto === "FTP" || proto === "FTPS") return;
     ptyStarted.current = true;
     setPtyClosed(false);
     term.reset();
@@ -39,7 +46,7 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
       ptyStarted.current = false;
       setPtyClosed(true);
     });
-  }, [isConnected, protocol, sessionId]);
+  }, [sessionId]);
 
   useEffect(() => {
     if (isVisible && fitAddonRef.current && terminalRef.current) {
@@ -92,30 +99,41 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
     });
 
     let disposed = false;
+    listenersReadyRef.current = false;
     let unlistenOutput: (() => void) | undefined;
     let unlistenClosed: (() => void) | undefined;
 
-    listen<string>(`ssh_pty_output_${sessionId}`, (event) => {
-      if (!disposed) {
-        term.write(event.payload);
-      }
-    })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlistenOutput = fn;
-      })
-      .catch(() => {});
-
-    listen<string>(`ssh_pty_closed_${sessionId}`, () => {
-      if (!disposed) {
-        ptyStarted.current = false;
-        setPtyClosed(true);
-        term.writeln("\r\n\x1b[33m[!] Canal shell SSH fermé par le serveur.\x1b[0m");
-      }
-    })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlistenClosed = fn;
+    Promise.all([
+      listen<string>(`ssh_pty_output_${sessionId}`, (event) => {
+        if (!disposed) {
+          term.write(event.payload);
+        }
+      }),
+      listen<void>(`ssh_pty_closed_${sessionId}`, () => {
+        if (!disposed) {
+          ptyStarted.current = false;
+          setPtyClosed(true);
+          term.writeln("\r\n\x1b[33m[!] Canal shell SSH fermé par le serveur.\x1b[0m");
+        }
+      }),
+    ])
+      .then(([fnOut, fnClosed]) => {
+        if (disposed) {
+          fnOut();
+          fnClosed();
+          return;
+        }
+        unlistenOutput = fnOut;
+        unlistenClosed = fnClosed;
+        listenersReadyRef.current = true;
+        if (
+          isConnectedRef.current &&
+          protocolRef.current !== "FTP" &&
+          protocolRef.current !== "FTPS" &&
+          !ptyStarted.current
+        ) {
+          launchPty();
+        }
       })
       .catch(() => {});
 
@@ -130,6 +148,7 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
 
     return () => {
       disposed = true;
+      listenersReadyRef.current = false;
       resizeObserver.disconnect();
       unlistenOutput?.();
       unlistenClosed?.();
@@ -138,7 +157,7 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
       fitAddonRef.current = null;
       ptyStarted.current = false;
     };
-  }, [sessionId]);
+  }, [sessionId, launchPty]);
 
   useEffect(() => {
     const term = xtermInstance.current;
@@ -153,7 +172,7 @@ export default function SshTerminal({ sessionId, isConnected, isVisible = true, 
         return;
       }
 
-      if (!ptyStarted.current) {
+      if (listenersReadyRef.current && !ptyStarted.current) {
         launchPty();
       }
     } else {

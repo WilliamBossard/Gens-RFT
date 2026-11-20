@@ -67,6 +67,16 @@ export function joinLocalPath(baseDir: string, name: string): string {
   return `${clean}${sep}${name}`;
 }
 
+export function replaceFilenameInLocalPath(fullPath: string, newName: string): string {
+  const lastSlash = fullPath.lastIndexOf("/");
+  const lastBackslash = fullPath.lastIndexOf("\\");
+  const idx = Math.max(lastSlash, lastBackslash);
+  if (idx < 0) return newName;
+  const sep = fullPath[idx];
+  const parent = fullPath.slice(0, idx);
+  return `${parent}${sep}${newName}`;
+}
+
 export function joinRemotePath(baseDir: string, name: string): string {
   if (!baseDir || baseDir === "/") return `/${name}`;
   return `${baseDir.replace(/\/+$/, "")}/${name}`;

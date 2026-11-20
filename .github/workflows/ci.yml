@@ -23,7 +23,10 @@ jobs:
 
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npm test
       - run: npm run build
+      - name: NPM Security Audit
+        run: npm audit --omit=dev --audit-level=high
 
   rust:
     name: Rust (${{ matrix.os }})
@@ -56,6 +59,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+
+      - name: Format check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

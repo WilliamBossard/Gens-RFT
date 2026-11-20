@@ -11,14 +11,108 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
+use crate::local::is_symlink_or_reparse;
 use crate::models::{FileEntry, RemoteTextFile, TransferProgress};
-use crate::security::{ClientHandler, unique_local_child_path};
+use crate::security::{
+    ClientHandler, is_safe_remote_delete_target, is_symlink_or_reparse_path,
+    is_valid_remote_filename, unique_local_child_path,
+};
 
 const MAX_EDITOR_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SAVE_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REMOTE_DELETE_DEPTH: usize = 64;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 const SYMLINK_CONCURRENCY: usize = 16;
 const FOLDER_TRANSFER_CONCURRENCY: usize = 4;
+
+#[derive(Clone)]
+pub struct FolderProgress {
+    pub cumulative: Arc<AtomicU64>,
+    pub total: u64,
+    pub started_at: Instant,
+    pub last_emit_ms: Arc<AtomicU64>,
+}
+
+impl FolderProgress {
+    pub fn new(total: u64) -> Self {
+        Self {
+            cumulative: Arc::new(AtomicU64::new(0)),
+            total,
+            started_at: Instant::now(),
+            last_emit_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+struct SftpProgressUpdate<'a> {
+    app: &'a AppHandle,
+    transfer_id: &'a str,
+    filename: &'a str,
+    direction: &'a str,
+    chunk_bytes: u64,
+    file_transferred: u64,
+    file_total: u64,
+}
+
+fn maybe_emit_sftp_progress(
+    upd: SftpProgressUpdate<'_>,
+    last_emit: &mut Instant,
+    folder_progress: Option<&FolderProgress>,
+) {
+    if let Some(fp) = folder_progress {
+        let current_cum =
+            fp.cumulative.fetch_add(upd.chunk_bytes, Ordering::Relaxed) + upd.chunk_bytes;
+        let now_ms = fp.started_at.elapsed().as_millis() as u64;
+        let prev_ms = fp.last_emit_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev_ms) >= 100
+            && fp
+                .last_emit_ms
+                .compare_exchange(prev_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let percent = if fp.total > 0 {
+                ((current_cum as f64 / fp.total as f64) * 100.0).min(99.9) as f32
+            } else {
+                0.0
+            };
+            let _ = upd.app.emit(
+                "transfer_progress",
+                TransferProgress {
+                    transfer_id: upd.transfer_id.to_string(),
+                    filename: upd.filename.to_string(),
+                    transferred: current_cum,
+                    total: fp.total,
+                    percent,
+                    direction: upd.direction.to_string(),
+                },
+            );
+        }
+        return;
+    }
+
+    if last_emit.elapsed().as_millis() >= 100
+        || (upd.file_total > 0 && upd.file_transferred >= upd.file_total)
+    {
+        let percent = if upd.file_total > 0 {
+            ((upd.file_transferred as f64 / upd.file_total as f64) * 100.0).min(99.9) as f32
+        } else {
+            0.0
+        };
+        let _ = upd.app.emit(
+            "transfer_progress",
+            TransferProgress {
+                transfer_id: upd.transfer_id.to_string(),
+                filename: upd.filename.to_string(),
+                transferred: upd.file_transferred,
+                total: upd.file_total,
+                percent,
+                direction: upd.direction.to_string(),
+            },
+        );
+        *last_emit = Instant::now();
+    }
+}
 
 async fn resolve_symlink_dirs(
     sftp: &Arc<SftpSession>,
@@ -95,9 +189,7 @@ pub async fn list_entries_sftp(
     }
 
     for (idx, resolved_is_dir) in resolve_symlink_dirs(sftp, symlink_indices).await {
-        if resolved_is_dir
-            && let Some(entry) = entries.get_mut(idx)
-        {
+        if resolved_is_dir && let Some(entry) = entries.get_mut(idx) {
             entry.is_dir = true;
         }
     }
@@ -107,10 +199,7 @@ pub async fn list_entries_sftp(
     Ok(entries)
 }
 
-pub async fn list_subdirs_sftp(
-    sftp: &Arc<SftpSession>,
-    path: &str,
-) -> Result<Vec<String>, String> {
+pub async fn list_subdirs_sftp(sftp: &Arc<SftpSession>, path: &str) -> Result<Vec<String>, String> {
     let dir = sftp
         .read_dir(path)
         .await
@@ -145,9 +234,7 @@ pub async fn list_subdirs_sftp(
             .map(|(i, (_, p))| (i, p.clone()))
             .collect();
         for (idx, is_dir) in resolve_symlink_dirs(sftp, indexed).await {
-            if is_dir
-                && let Some((name, _)) = symlinks.get(idx)
-            {
+            if is_dir && let Some((name, _)) = symlinks.get(idx) {
                 dirs.push(name.clone());
             }
         }
@@ -194,15 +281,18 @@ pub async fn upload_single_file_sftp(
     transfer_id: &str,
     local_path: &str,
     remote_path: &str,
-    folder_progress: Option<(Arc<AtomicU64>, u64)>,
+    folder_progress: Option<FolderProgress>,
 ) -> Result<(), String> {
+    if is_symlink_or_reparse_path(Path::new(local_path)) {
+        return Err("Refus d'uploader un lien symbolique ou junction local.".to_string());
+    }
     let mut local_file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| format!("Erreur ouverture {}: {}", local_path, e))?;
 
     let total_size = local_file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let buf_cap = if total_size > 0 {
-        (total_size as usize).clamp(4 * 1024, 256 * 1024)
+        (total_size as usize).clamp(4 * 1024, 512 * 1024)
     } else {
         256 * 1024
     };
@@ -262,38 +352,19 @@ pub async fn upload_single_file_sftp(
 
         transferred += n as u64;
 
-        let (emit_transferred, emit_total, percent) =
-            if let Some((ref cum_atomic, folder_total)) = folder_progress {
-                let current_cum = cum_atomic.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                let p = if folder_total > 0 {
-                    ((current_cum as f64 / folder_total as f64) * 100.0).min(99.9) as f32
-                } else {
-                    0.0
-                };
-                (current_cum, folder_total, p)
-            } else {
-                let p = if total_size > 0 {
-                    ((transferred as f64 / total_size as f64) * 100.0).min(99.9) as f32
-                } else {
-                    0.0
-                };
-                (transferred, total_size, p)
-            };
-
-        if last_emit.elapsed().as_millis() >= 100 || (total_size > 0 && transferred >= total_size) {
-            let _ = app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: transfer_id.to_string(),
-                    filename: filename.clone(),
-                    transferred: emit_transferred,
-                    total: emit_total,
-                    percent,
-                    direction: "upload".into(),
-                },
-            );
-            last_emit = Instant::now();
-        }
+        maybe_emit_sftp_progress(
+            SftpProgressUpdate {
+                app,
+                transfer_id,
+                filename: &filename,
+                direction: "upload",
+                chunk_bytes: n as u64,
+                file_transferred: transferred,
+                file_total: total_size,
+            },
+            &mut last_emit,
+            folder_progress.as_ref(),
+        );
     }
 
     if let Err(e) = remote_file.flush().await {
@@ -331,7 +402,10 @@ async fn ensure_remote_dir(sftp: &SftpSession, path: &str) -> Result<(), String>
         {
             return Ok(());
         }
-        return Err(format!("Impossible de créer le dossier distant ({}): {}", path, e));
+        return Err(format!(
+            "Impossible de créer le dossier distant ({}): {}",
+            path, e
+        ));
     }
     Ok(())
 }
@@ -345,6 +419,9 @@ pub async fn upload_dir_sftp(
     local_path: &str,
     root_remote: &str,
 ) -> Result<(), String> {
+    if is_symlink_or_reparse_path(Path::new(local_path)) {
+        return Err("Refus d'uploader un lien symbolique ou junction local.".to_string());
+    }
     ensure_remote_dir(sftp, root_remote).await?;
 
     let local_path_owned = local_path.to_string();
@@ -357,13 +434,13 @@ pub async fn upload_dir_sftp(
             let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
             let mut total_folder_bytes: u64 = 0;
 
-            for entry_res in WalkDir::new(&local_path_owned) {
+            for entry_res in WalkDir::new(&local_path_owned).follow_links(false) {
                 if cancel_walk.load(Ordering::Relaxed) {
                     return Err("Transfert annulé par l'utilisateur".to_string());
                 }
                 let entry = entry_res.map_err(|e| format!("Erreur lecture locale: {}", e))?;
-                // Ignorer les liens symboliques pour éviter toute fuite involontaire hors du dossier
-                if entry.file_type().is_symlink() {
+                // Ignorer les liens symboliques et junctions NTFS pour éviter toute fuite hors du dossier
+                if is_symlink_or_reparse(&entry.file_type(), entry.path()) {
                     continue;
                 }
                 let rel = match entry.path().strip_prefix(&local_path_owned) {
@@ -434,7 +511,7 @@ pub async fn upload_dir_sftp(
         }
     }
 
-    let cumulative = Arc::new(AtomicU64::new(0));
+    let folder_progress = FolderProgress::new(total_folder_bytes);
     let total_files = files_to_upload.len();
     let file_queue = Arc::new(Mutex::new(VecDeque::from(files_to_upload)));
     let worker_count = FOLDER_TRANSFER_CONCURRENCY.min(total_files.max(1));
@@ -445,7 +522,7 @@ pub async fn upload_dir_sftp(
         let sftp_c = Arc::clone(sftp);
         let cancel_c = Arc::clone(&cancel_flag);
         let tid = transfer_id.to_string();
-        let cum_c = Arc::clone(&cumulative);
+        let fp_c = folder_progress.clone();
         let session_sem_c = Arc::clone(session_sem);
         let q_c = Arc::clone(&file_queue);
 
@@ -460,10 +537,7 @@ pub async fn upload_dir_sftp(
                     break;
                 };
 
-                let _session_permit = session_sem_c
-                    .acquire()
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let _session_permit = session_sem_c.acquire().await.map_err(|e| e.to_string())?;
                 if cancel_c.load(Ordering::Relaxed) {
                     return Err("Transfert annulé par l'utilisateur".to_string());
                 }
@@ -474,7 +548,7 @@ pub async fn upload_dir_sftp(
                     &tid,
                     &local_file_path.to_string_lossy(),
                     &remote_target,
-                    Some((Arc::clone(&cum_c), total_folder_bytes)),
+                    Some(fp_c.clone()),
                 )
                 .await
                 {
@@ -590,8 +664,11 @@ pub async fn download_single_file_sftp(
     remote_path: &str,
     local_path: &Path,
     known_size: Option<u64>,
-    folder_progress: Option<(Arc<AtomicU64>, u64)>,
+    folder_progress: Option<FolderProgress>,
 ) -> Result<(), String> {
+    if is_symlink_or_reparse_path(local_path) {
+        return Err("Refus d'écraser un lien symbolique ou junction local.".to_string());
+    }
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             format!(
@@ -609,10 +686,10 @@ pub async fn download_single_file_sftp(
 
     let total_size = match known_size {
         Some(s) => s,
-        None => match sftp.metadata(remote_path).await {
-            Ok(m) => m.size.unwrap_or(0),
-            Err(_) => remote_file
-                .metadata()
+        None => match remote_file.metadata().await {
+            Ok(m) if m.size.is_some() => m.size.unwrap_or(0),
+            _ => sftp
+                .metadata(remote_path)
                 .await
                 .map(|m| m.size.unwrap_or(0))
                 .unwrap_or(0),
@@ -620,7 +697,7 @@ pub async fn download_single_file_sftp(
     };
 
     let buf_cap = if total_size > 0 {
-        (total_size as usize).clamp(4 * 1024, 256 * 1024)
+        (total_size as usize).clamp(4 * 1024, 512 * 1024)
     } else {
         256 * 1024
     };
@@ -634,9 +711,11 @@ pub async fn download_single_file_sftp(
             .as_nanos()
     );
     let temp_local_file = match local_path.file_name() {
-        Some(name) => {
-            local_path.with_file_name(format!("{}.gens_part_{}", name.to_string_lossy(), unique_suffix))
-        }
+        Some(name) => local_path.with_file_name(format!(
+            "{}.gens_part_{}",
+            name.to_string_lossy(),
+            unique_suffix
+        )),
         None => local_path.to_path_buf(),
     };
 
@@ -683,38 +762,19 @@ pub async fn download_single_file_sftp(
 
         transferred += n as u64;
 
-        let (emit_transferred, emit_total, percent) =
-            if let Some((ref cum_atomic, folder_total)) = folder_progress {
-                let current_cum = cum_atomic.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                let p = if folder_total > 0 {
-                    ((current_cum as f64 / folder_total as f64) * 100.0).min(99.9) as f32
-                } else {
-                    0.0
-                };
-                (current_cum, folder_total, p)
-            } else {
-                let p = if total_size > 0 {
-                    ((transferred as f64 / total_size as f64) * 100.0).min(99.9) as f32
-                } else {
-                    0.0
-                };
-                (transferred, total_size, p)
-            };
-
-        if last_emit.elapsed().as_millis() >= 100 || (total_size > 0 && transferred >= total_size) {
-            let _ = app.emit(
-                "transfer_progress",
-                TransferProgress {
-                    transfer_id: transfer_id.to_string(),
-                    filename: filename.clone(),
-                    transferred: emit_transferred,
-                    total: emit_total,
-                    percent,
-                    direction: "download".into(),
-                },
-            );
-            last_emit = Instant::now();
-        }
+        maybe_emit_sftp_progress(
+            SftpProgressUpdate {
+                app,
+                transfer_id,
+                filename: &filename,
+                direction: "download",
+                chunk_bytes: n as u64,
+                file_transferred: transferred,
+                file_total: total_size,
+            },
+            &mut last_emit,
+            folder_progress.as_ref(),
+        );
     }
 
     local_file
@@ -765,64 +825,95 @@ pub async fn download_dir_sftp(
         .await
         .unwrap_or_else(|_| remote_path.to_string());
     visited.insert(root_canon);
-    let mut queue = vec![(remote_path.to_string(), root_local_dir.clone(), 0usize)];
+    visited.insert(remote_path.trim_end_matches('/').to_string());
+    let mut current_level = vec![(remote_path.to_string(), root_local_dir.clone())];
 
-    while let Some((rem_dir, loc_dir, depth)) = queue.pop() {
+    for depth in 0..=40 {
+        if current_level.is_empty() {
+            break;
+        }
         if cancel_flag.load(Ordering::Relaxed) {
             return Err("Transfert annulé par l'utilisateur".to_string());
         }
-        if depth > 40 {
-            continue;
+
+        let level_queue = Arc::new(Mutex::new(VecDeque::from(current_level)));
+        let scan_workers = FOLDER_TRANSFER_CONCURRENCY.min(level_queue.lock().await.len().max(1));
+        let mut scan_set = JoinSet::new();
+
+        for _ in 0..scan_workers {
+            let sftp_c = Arc::clone(sftp);
+            let cancel_c = Arc::clone(&cancel_flag);
+            let q_c = Arc::clone(&level_queue);
+            scan_set.spawn(async move {
+                let mut local_results = Vec::new();
+                loop {
+                    if cancel_c.load(Ordering::Relaxed) {
+                        return Err("Transfert annulé par l'utilisateur".to_string());
+                    }
+                    let next = { q_c.lock().await.pop_front() };
+                    let Some((rem_dir, loc_dir)) = next else {
+                        break;
+                    };
+                    let dir = sftp_c.read_dir(&rem_dir).await.map_err(|e| {
+                        format!("Erreur lecture dossier distant {}: {}", rem_dir, e)
+                    })?;
+                    let items: Vec<_> = dir.into_iter().collect();
+                    local_results.push((rem_dir, loc_dir, items));
+                }
+                Ok(local_results)
+            });
         }
 
-        let dir = sftp
-            .read_dir(&rem_dir)
-            .await
-            .map_err(|e| format!("Erreur lecture dossier distant {}: {}", rem_dir, e))?;
-
-        for item in dir {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Transfert annulé par l'utilisateur".to_string());
-            }
-            let sub_name = item.file_name();
-            if sub_name == "." || sub_name == ".." {
-                continue;
-            }
-            let sub_rem = format!("{}/{}", rem_dir.trim_end_matches('/'), sub_name);
-            let sub_loc = unique_local_child_path(&loc_dir, &sub_name, &mut used_local_paths);
-
-            let mut is_sub_dir = item.file_type().is_dir();
-            let mut visit_key = sub_rem.clone();
-            if item.file_type().is_symlink()
-                && let Ok(target_meta) = sftp.metadata(&sub_rem).await
-                && target_meta.is_dir()
-            {
-                let canon = sftp
-                    .canonicalize(&sub_rem)
-                    .await
-                    .unwrap_or_else(|_| sub_rem.clone());
-                if !visited.contains(&canon) {
-                    is_sub_dir = true;
-                    visit_key = canon;
+        let mut next_level = Vec::new();
+        while let Some(res) = scan_set.join_next().await {
+            let batch = match res {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    scan_set.abort_all();
+                    return Err(e);
                 }
-            }
-
-            if is_sub_dir {
-                if visited.insert(visit_key) {
-                    tokio::fs::create_dir_all(&sub_loc)
-                        .await
-                        .map_err(|e| format!("Impossible de créer {}: {}", sub_loc.display(), e))?;
-                    queue.push((sub_rem, sub_loc, depth + 1));
+                Err(e) => {
+                    scan_set.abort_all();
+                    return Err(e.to_string());
                 }
-            } else {
-                let size = item.metadata().size.unwrap_or(0);
-                total_folder_bytes = total_folder_bytes.saturating_add(size);
-                files_to_download.push((sub_rem, sub_loc, size));
+            };
+
+            for (rem_dir, loc_dir, items) in batch {
+                for item in items {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return Err("Transfert annulé par l'utilisateur".to_string());
+                    }
+                    let sub_name = item.file_name();
+                    if !is_valid_remote_filename(&sub_name) {
+                        continue;
+                    }
+                    // Ignorer les liens symboliques distants pour éviter boucles infinies et accès hors arborescence
+                    if item.file_type().is_symlink() {
+                        continue;
+                    }
+                    let sub_rem = format!("{}/{}", rem_dir.trim_end_matches('/'), sub_name);
+                    let sub_loc =
+                        unique_local_child_path(&loc_dir, &sub_name, &mut used_local_paths);
+
+                    if item.file_type().is_dir() {
+                        if depth < 40 && visited.insert(sub_rem.clone()) {
+                            tokio::fs::create_dir_all(&sub_loc).await.map_err(|e| {
+                                format!("Impossible de créer {}: {}", sub_loc.display(), e)
+                            })?;
+                            next_level.push((sub_rem, sub_loc));
+                        }
+                    } else {
+                        let size = item.metadata().size.unwrap_or(0);
+                        total_folder_bytes = total_folder_bytes.saturating_add(size);
+                        files_to_download.push((sub_rem, sub_loc, size));
+                    }
+                }
             }
         }
+        current_level = next_level;
     }
 
-    let cumulative = Arc::new(AtomicU64::new(0));
+    let folder_progress = FolderProgress::new(total_folder_bytes);
     let total_files = files_to_download.len();
     let file_queue = Arc::new(Mutex::new(VecDeque::from(files_to_download)));
     let worker_count = FOLDER_TRANSFER_CONCURRENCY.min(total_files.max(1));
@@ -833,7 +924,7 @@ pub async fn download_dir_sftp(
         let sftp_c = Arc::clone(sftp);
         let cancel_c = Arc::clone(&cancel_flag);
         let tid = transfer_id.to_string();
-        let cum_c = Arc::clone(&cumulative);
+        let fp_c = folder_progress.clone();
         let session_sem_c = Arc::clone(session_sem);
         let q_c = Arc::clone(&file_queue);
 
@@ -848,10 +939,7 @@ pub async fn download_dir_sftp(
                     break;
                 };
 
-                let _session_permit = session_sem_c
-                    .acquire()
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let _session_permit = session_sem_c.acquire().await.map_err(|e| e.to_string())?;
                 if cancel_c.load(Ordering::Relaxed) {
                     return Err("Transfert annulé par l'utilisateur".to_string());
                 }
@@ -863,7 +951,7 @@ pub async fn download_dir_sftp(
                     &sub_rem,
                     &sub_loc,
                     Some(file_size),
-                    Some((Arc::clone(&cum_c), total_folder_bytes)),
+                    Some(fp_c.clone()),
                 )
                 .await
                 {
@@ -924,7 +1012,10 @@ pub async fn download_dir_sftp(
     Ok(())
 }
 
-pub async fn read_text_sftp(sftp: &SftpSession, remote_path: &str) -> Result<RemoteTextFile, String> {
+pub async fn read_text_sftp(
+    sftp: &SftpSession,
+    remote_path: &str,
+) -> Result<RemoteTextFile, String> {
     if let Ok(meta) = sftp.metadata(remote_path).await
         && meta.size.unwrap_or(0) > MAX_EDITOR_BYTES as u64
     {
@@ -957,6 +1048,15 @@ pub async fn save_text_sftp(
     remote_path: &str,
     content: &str,
 ) -> Result<(), String> {
+    if content.len() > MAX_SAVE_TEXT_BYTES {
+        return Err("Contenu trop volumineux (> 16 Mo) pour la sauvegarde texte.".to_string());
+    }
+    let original_perms = sftp
+        .metadata(remote_path)
+        .await
+        .ok()
+        .and_then(|m| m.permissions);
+
     let unique_suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -980,28 +1080,49 @@ pub async fn save_text_sftp(
     let _ = remote_file.shutdown().await;
     drop(remote_file);
 
-    atomic_replace_remote(sftp, &temp_path, remote_path, &unique_suffix).await
+    let mut perms_applied_before_rename = false;
+    if let Some(perms) = original_perms
+        && let Ok(mut tmp_meta) = sftp.metadata(&temp_path).await
+    {
+        tmp_meta.permissions = Some(perms);
+        if sftp.set_metadata(&temp_path, tmp_meta).await.is_ok() {
+            perms_applied_before_rename = true;
+        }
+    }
+
+    atomic_replace_remote(sftp, &temp_path, remote_path, &unique_suffix).await?;
+
+    if !perms_applied_before_rename
+        && let Some(perms) = original_perms
+        && let Ok(mut new_meta) = sftp.metadata(remote_path).await
+    {
+        new_meta.permissions = Some(perms);
+        let _ = sftp.set_metadata(remote_path, new_meta).await;
+    }
+
+    Ok(())
 }
 
-pub async fn remove_dir_recursive_sftp(
-    sftp: &SftpSession,
-    root_path: &str,
-) -> Result<(), String> {
-    if root_path.trim().is_empty() || root_path == "/" {
-        return Err("Refus de supprimer la racine du serveur".to_string());
+pub async fn remove_dir_recursive_sftp(sftp: &SftpSession, root_path: &str) -> Result<(), String> {
+    if !is_safe_remote_delete_target(root_path) {
+        return Err("Refus de supprimer la racine ou un dossier système protégé".to_string());
     }
     fn delete_sftp_dir<'a>(
         sftp: &'a SftpSession,
         path: &'a str,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            if depth > MAX_REMOTE_DELETE_DEPTH {
+                return Err("Profondeur maximale atteinte lors de la suppression SFTP".to_string());
+            }
             let dir = sftp
                 .read_dir(path)
                 .await
                 .map_err(|e| format!("Erreur lecture {}: {}", path, e))?;
             for item in dir {
                 let name = item.file_name();
-                if name == "." || name == ".." {
+                if !is_valid_remote_filename(&name) {
                     continue;
                 }
                 let child_path = if path.ends_with('/') {
@@ -1014,7 +1135,7 @@ pub async fn remove_dir_recursive_sftp(
                         .await
                         .map_err(|e| format!("Erreur suppression lien {}: {}", child_path, e))?;
                 } else if item.file_type().is_dir() {
-                    delete_sftp_dir(sftp, &child_path).await?;
+                    delete_sftp_dir(sftp, &child_path, depth + 1).await?;
                 } else {
                     sftp.remove_file(&child_path)
                         .await
@@ -1024,12 +1145,13 @@ pub async fn remove_dir_recursive_sftp(
             sftp.remove_dir(path).await.map_err(|e| e.to_string())
         })
     }
-    delete_sftp_dir(sftp, root_path).await
+    delete_sftp_dir(sftp, root_path, 0).await
 }
 
-pub async fn exec_ssh_command(
+pub async fn exec_ssh_command_checked(
     ssh_arc: Arc<Mutex<client::Handle<ClientHandler>>>,
     command: &str,
+    fail_on_truncation: bool,
 ) -> Result<String, String> {
     let mut channel = {
         let session = tokio::time::timeout(Duration::from_secs(15), ssh_arc.lock())
@@ -1041,13 +1163,17 @@ pub async fn exec_ssh_command(
             .map_err(|e| format!("Impossible d'ouvrir un canal SSH : {}", e))?
     };
 
-    tokio::time::timeout(Duration::from_secs(15), channel.exec(true, command.as_bytes()))
-        .await
-        .map_err(|_| "Timeout lancement commande SSH".to_string())?
-        .map_err(|e| format!("Erreur exécution commande : {}", e))?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        channel.exec(true, command.as_bytes()),
+    )
+    .await
+    .map_err(|_| "Timeout lancement commande SSH".to_string())?
+    .map_err(|e| format!("Erreur exécution commande : {}", e))?;
 
     let mut output = Vec::new();
     let mut exit_status: Option<u32> = None;
+    let mut truncated = false;
 
     let read_res = tokio::time::timeout(EXEC_TIMEOUT, async {
         while let Some(msg) = channel.wait().await {
@@ -1057,9 +1183,16 @@ pub async fn exec_ssh_command(
                     if remaining > 0 {
                         let take = remaining.min(data.len());
                         output.extend_from_slice(&data[..take]);
+                        if data.len() > take {
+                            truncated = true;
+                        }
+                    } else if !data.is_empty() {
+                        truncated = true;
                     }
                 }
-                ChannelMsg::ExitStatus { exit_status: status } => {
+                ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => {
                     exit_status = Some(status);
                 }
                 ChannelMsg::Eof => break,
@@ -1072,6 +1205,10 @@ pub async fn exec_ssh_command(
     if read_res.is_err() {
         let _ = channel.close().await;
         return Err("Timeout d'exécution de la commande distante (120s)".to_string());
+    }
+
+    if fail_on_truncation && truncated {
+        return Err("Sortie de commande distante trop volumineuse (> 2 Mo), inspection interrompue par sécurité.".to_string());
     }
 
     let out_str = String::from_utf8_lossy(&output).trim().to_string();

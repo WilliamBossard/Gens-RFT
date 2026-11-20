@@ -84,6 +84,7 @@ function BottomPanelComponent({
   activeTab,
 }: Props) {
   const [activatedTerminalTabs, setActivatedTerminalTabs] = useState<Record<string, boolean>>({});
+  const footerRef = useRef<HTMLElement>(null);
 
   const runningOrQueuedCount = useTransferStore(
     (state) => state.queue.filter((q) => q.status === "queued" || q.status === "running").length
@@ -133,12 +134,17 @@ function BottomPanelComponent({
         onMouseDown={(e) => {
           const startY = e.clientY;
           const startH = bottomHeight;
+          let latestH = startH;
           const onMouseMove = (ev: MouseEvent) => {
-            setBottomHeight(Math.max(100, Math.min(500, startH - (ev.clientY - startY))));
+            latestH = Math.max(100, Math.min(500, startH - (ev.clientY - startY)));
+            if (footerRef.current && bottomOpen) {
+              footerRef.current.style.height = `${latestH}px`;
+            }
           };
           const onMouseUp = () => {
             window.removeEventListener("mousemove", onMouseMove);
             window.removeEventListener("mouseup", onMouseUp);
+            setBottomHeight(latestH);
           };
           window.addEventListener("mousemove", onMouseMove);
           window.addEventListener("mouseup", onMouseUp);
@@ -149,6 +155,7 @@ function BottomPanelComponent({
 
       {/* Console inférieure */}
       <footer
+        ref={footerRef}
         style={{ height: bottomOpen ? `${bottomHeight}px` : "32px" }}
         className={`border-t flex flex-col ${
           isDark ? "border-neutral-800 bg-neutral-900 text-neutral-200" : "border-neutral-300 bg-neutral-100 text-neutral-800"

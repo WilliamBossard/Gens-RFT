@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
 import {
+  SiteProfileSummary,
   decryptVaultDataStrict,
-  exportVaultData,
+  exportVaultEncryptedToPath,
   isPasswordProtectedExport,
+  saveSiteProfile,
+  deleteSiteProfile,
+  importVaultProfiles,
+  getSiteSecretsForEdit,
 } from "../../utils/cryptoVault";
 import {
   SlidersHorizontal,
@@ -15,34 +19,33 @@ import {
   FileUp,
   FileDown,
   FolderOpen,
+  Eye,
 } from "lucide-react";
 
-export interface SiteProfile {
-  id: string;
-  name: string;
-  protocol: "SFTP" | "FTP" | "FTPS";
-  host: string;
-  port: string;
-  authType: "password" | "key";
-  username: string;
-  password?: string;
-  keyPath?: string;
-  passphrase?: string;
-  lastRemotePath?: string;
-  lastLocalPath?: string;
-  acceptInvalidCerts?: boolean;
-}
+export type { SiteProfileSummary };
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
-  sites: SiteProfile[];
-  setSites: (sites: SiteProfile[]) => void;
-  onConnect: (site: SiteProfile) => void;
+  sites: SiteProfileSummary[];
+  setSites: (sites: SiteProfileSummary[]) => void;
+  onConnect: (site: SiteProfileSummary) => void;
   isDark: boolean;
   logMessage: (msg: string) => void;
   vaultLoadFailed?: boolean;
 }
+
+const EMPTY_SITE_FORM: SiteProfileSummary = {
+  id: "",
+  name: "Nouveau serveur",
+  protocol: "SFTP",
+  host: "",
+  port: "22",
+  authType: "password",
+  username: "",
+  hasPassword: false,
+  hasPassphrase: false,
+};
 
 export default function SiteManagerModal({
   isOpen,
@@ -55,18 +58,14 @@ export default function SiteManagerModal({
   vaultLoadFailed = false,
 }: Props) {
   const [selectedSiteId, setSelectedSiteId] = useState<string | null>(sites[0]?.id || null);
-  const [siteForm, setSiteForm] = useState<SiteProfile>(
-    sites[0] || {
-      id: "",
-      name: "Nouveau serveur",
-      protocol: "SFTP",
-      host: "",
-      port: "22",
-      authType: "password",
-      username: "",
-      password: "",
-    }
-  );
+  const [siteForm, setSiteForm] = useState<SiteProfileSummary>(sites[0] || EMPTY_SITE_FORM);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passphraseInput, setPassphraseInput] = useState("");
+  const [clearPassword, setClearPassword] = useState(false);
+  const [clearPassphrase, setClearPassphrase] = useState(false);
+  const [secretsRevealed, setSecretsRevealed] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
+  const [pendingSwitchSite, setPendingSwitchSite] = useState<SiteProfileSummary | null>(null);
 
   const prevIsOpenRef = useRef(false);
   const [vaultPwdPrompt, setVaultPwdPrompt] = useState<{
@@ -77,9 +76,25 @@ export default function SiteManagerModal({
   const [vaultPwdError, setVaultPwdError] = useState("");
   const [plaintextImportPending, setPlaintextImportPending] = useState<string | null>(null);
 
+  const resetSecretInputs = () => {
+    setPasswordInput("");
+    setPassphraseInput("");
+    setClearPassword(false);
+    setClearPassphrase(false);
+    setSecretsRevealed(false);
+    setIsDirty(false);
+    setPendingSwitchSite(null);
+  };
+
+  const updateSiteForm = (next: SiteProfileSummary) => {
+    setSiteForm(next);
+    setIsDirty(true);
+  };
+
   useEffect(() => {
     // Ne synchroniser à l'ouverture que si la modale vient de s'ouvrir
     if (isOpen && !prevIsOpenRef.current) {
+      resetSecretInputs();
       if (selectedSiteId) {
         const found = sites.find((s) => s.id === selectedSiteId);
         if (found) {
@@ -93,35 +108,68 @@ export default function SiteManagerModal({
         setSiteForm(sites[0]);
       } else {
         setSelectedSiteId(null);
+        setSiteForm(EMPTY_SITE_FORM);
       }
+    }
+    if (!isOpen && prevIsOpenRef.current) {
+      resetSecretInputs();
     }
     prevIsOpenRef.current = isOpen;
   }, [isOpen, sites, selectedSiteId]);
 
-  const getSyncedSites = (): SiteProfile[] => {
-    if (selectedSiteId && siteForm.id === selectedSiteId) {
-      return sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
-    }
-    return sites;
-  };
-
-  const handleSelectSite = (site: SiteProfile) => {
-    const synced = getSyncedSites();
-    if (synced !== sites) {
-      setSites(synced);
-    }
+  const applySwitchSite = (site: SiteProfileSummary) => {
+    resetSecretInputs();
     setSelectedSiteId(site.id);
     setSiteForm(site);
+  };
+
+  const handleSelectSite = (site: SiteProfileSummary) => {
+    if (site.id === selectedSiteId) return;
+    if (isDirty) {
+      setPendingSwitchSite(site);
+      return;
+    }
+    applySwitchSite(site);
+  };
+
+  const saveCurrentForm = async (): Promise<SiteProfileSummary | null> => {
+    if (vaultLoadFailed) {
+      logMessage("Sauvegarde bloquée : le coffre initial n'a pas pu être déchiffré (protection anti-écrasement).");
+      return null;
+    }
+    if (!selectedSiteId) return null;
+    const updatedList = await saveSiteProfile({
+      id: siteForm.id || selectedSiteId,
+      name: siteForm.name,
+      protocol: siteForm.protocol,
+      host: siteForm.host,
+      port: siteForm.port,
+      authType: siteForm.protocol === "SFTP" ? siteForm.authType : "password",
+      username: siteForm.username,
+      password: secretsRevealed || passwordInput.length > 0 ? passwordInput : undefined,
+      clearPassword,
+      keyPath: siteForm.keyPath,
+      passphrase: secretsRevealed || passphraseInput.length > 0 ? passphraseInput : undefined,
+      clearPassphrase,
+      lastRemotePath: siteForm.lastRemotePath,
+      lastLocalPath: siteForm.lastLocalPath,
+      acceptInvalidCerts: !!siteForm.acceptInvalidCerts,
+    });
+    setSites(updatedList);
+    const saved = updatedList.find((s) => s.id === selectedSiteId) || siteForm;
+    setSiteForm(saved);
+    resetSecretInputs();
+    return saved;
   };
 
   if (!isOpen) return null;
 
   const runExportWithPassword = async (password: string) => {
+    if (vaultLoadFailed) {
+      logMessage("Export annulé : le coffre n'est pas chargé.");
+      return;
+    }
     try {
-      const synced = getSyncedSites();
-      if (synced !== sites) {
-        setSites(synced);
-      }
       const defaultFileName = `gens_rft_sites_${new Date().toISOString().slice(0, 10)}.json`;
       const filePath = await save({
         filters: [{ name: "Fichier JSON", extensions: ["json"] }],
@@ -129,8 +177,7 @@ export default function SiteManagerModal({
       });
 
       if (filePath) {
-        const encryptedContent = await exportVaultData(synced, password);
-        await invoke("export_sites_to_path", { filePath, jsonContent: encryptedContent });
+        await exportVaultEncryptedToPath(filePath, password);
         logMessage(`Serveurs exportés avec chiffrement vers : ${filePath}`);
       }
     } catch (err) {
@@ -145,13 +192,17 @@ export default function SiteManagerModal({
   };
 
   const applyImportedRaw = async (raw: string, password?: string) => {
+    if (vaultLoadFailed) {
+      logMessage("Import annulé : le coffre initial est verrouillé.");
+      return;
+    }
     try {
       let parsed: unknown;
       if (raw.startsWith("enc:")) {
         if (!isPasswordProtectedExport(raw)) {
           throw new Error("Ce format de fichier chiffré interne ne peut pas être importé sans mot de passe.");
         }
-        parsed = await decryptVaultDataStrict<SiteProfile[]>(raw, password);
+        parsed = await decryptVaultDataStrict<unknown[]>(raw, password);
         if (!Array.isArray(parsed)) {
           throw new Error("Déchiffrement impossible (mot de passe incorrect ou format invalide).");
         }
@@ -159,16 +210,16 @@ export default function SiteManagerModal({
         parsed = JSON.parse(raw);
       }
       if (!Array.isArray(parsed)) throw new Error("Format de fichier non valide.");
-      const map = new Map<string, SiteProfile>();
-      sites.forEach((s) => map.set(s.id, s));
-      parsed.forEach((s: SiteProfile) => {
-        if (s.name && s.host) {
-          const id = s.id || `site_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-          map.set(id, { ...s, id });
-        }
-      });
-      const updated = Array.from(map.values());
+      const updated = await importVaultProfiles(parsed);
       setSites(updated);
+      resetSecretInputs();
+      if (updated.length > 0) {
+        setSelectedSiteId(updated[0].id);
+        setSiteForm(updated[0]);
+      } else {
+        setSelectedSiteId(null);
+        setSiteForm(EMPTY_SITE_FORM);
+      }
       logMessage(`Import réussi : ${updated.length} profils chargés.`);
     } catch (err) {
       logMessage(`Erreur import : ${err}`);
@@ -176,6 +227,11 @@ export default function SiteManagerModal({
   };
 
   const handleImport = (file: File) => {
+    const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
+    if (file.size > MAX_IMPORT_BYTES) {
+      logMessage("Erreur import : fichier trop volumineux (> 10 Mo).");
+      return;
+    }
     const reader = new FileReader();
     reader.onload = async (e) => {
       const raw = ((e.target?.result as string) || "").trim();
@@ -240,21 +296,36 @@ export default function SiteManagerModal({
             <div className="space-y-2 pt-2 border-t border-neutral-500/20">
               <div className="flex gap-2">
                 <button
-                  onClick={() => {
-                    const synced = getSyncedSites();
-                    const newSite: SiteProfile = {
-                      id: Date.now().toString(),
-                      name: `Serveur ${synced.length + 1}`,
-                      protocol: "SFTP",
-                      host: "",
-                      port: "22",
-                      authType: "password",
-                      username: "",
-                      password: "",
-                    };
-                    setSites([...synced, newSite]);
-                    setSelectedSiteId(newSite.id);
-                    setSiteForm(newSite);
+                  onClick={async () => {
+                    if (vaultLoadFailed) {
+                      logMessage("Création bloquée : coffre verrouillé.");
+                      return;
+                    }
+                    try {
+                      const newId =
+                        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+                          ? crypto.randomUUID()
+                          : Date.now().toString();
+                      const updated = await saveSiteProfile({
+                        id: newId,
+                        name: `Serveur ${sites.length + 1}`,
+                        protocol: "SFTP",
+                        host: "",
+                        port: "22",
+                        authType: "password",
+                        username: "",
+                        clearPassword: false,
+                        clearPassphrase: false,
+                        acceptInvalidCerts: false,
+                      });
+                      setSites(updated);
+                      const created = updated.find((s) => s.id === newId);
+                      resetSecretInputs();
+                      setSelectedSiteId(newId);
+                      if (created) setSiteForm(created);
+                    } catch (err) {
+                      logMessage(`Erreur création profil : ${err}`);
+                    }
                   }}
                   className="flex flex-1 items-center justify-center gap-1 py-1.5 rounded border border-neutral-700 hover:bg-neutral-500/10 text-xs cursor-pointer transition active:scale-95"
                 >
@@ -262,10 +333,17 @@ export default function SiteManagerModal({
                 </button>
                 {selectedSiteId && (
                   <button
-                    onClick={() => {
-                      const synced = getSyncedSites();
-                      setSites(synced.filter((s) => s.id !== selectedSiteId));
-                      setSelectedSiteId(null);
+                    onClick={async () => {
+                      if (vaultLoadFailed || !selectedSiteId) return;
+                      try {
+                        const remaining = await deleteSiteProfile(selectedSiteId);
+                        setSites(remaining);
+                        resetSecretInputs();
+                        setSelectedSiteId(remaining[0]?.id || null);
+                        setSiteForm(remaining[0] || EMPTY_SITE_FORM);
+                      } catch (err) {
+                        logMessage(`Erreur suppression profil : ${err}`);
+                      }
                     }}
                     className="px-2 py-1.5 rounded border border-rose-500/30 text-rose-500 hover:bg-rose-500/10 text-xs cursor-pointer transition active:scale-95"
                   >
@@ -309,7 +387,7 @@ export default function SiteManagerModal({
                     <input
                       type="text"
                       value={siteForm.name}
-                      onChange={(e) => setSiteForm({ ...siteForm, name: e.target.value })}
+                      onChange={(e) => updateSiteForm({ ...siteForm, name: e.target.value })}
                       className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                         isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                       }`}
@@ -321,10 +399,11 @@ export default function SiteManagerModal({
                       value={siteForm.protocol}
                       onChange={(e) => {
                         const prot = e.target.value as "SFTP" | "FTP" | "FTPS";
-                        setSiteForm({
+                        updateSiteForm({
                           ...siteForm,
                           protocol: prot,
                           port: prot === "SFTP" ? "22" : "21",
+                          authType: prot === "SFTP" ? siteForm.authType : "password",
                         });
                       }}
                       className={`w-full rounded border px-3 py-1.5 focus:outline-none cursor-pointer transition ${
@@ -344,7 +423,7 @@ export default function SiteManagerModal({
                       type="checkbox"
                       checked={!!siteForm.acceptInvalidCerts}
                       onChange={(e) =>
-                        setSiteForm({ ...siteForm, acceptInvalidCerts: e.target.checked })
+                        updateSiteForm({ ...siteForm, acceptInvalidCerts: e.target.checked })
                       }
                       className="rounded cursor-pointer"
                     />
@@ -359,7 +438,7 @@ export default function SiteManagerModal({
                       type="text"
                       placeholder="192.168.1.100 ou sftp.domaine.com"
                       value={siteForm.host}
-                      onChange={(e) => setSiteForm({ ...siteForm, host: e.target.value })}
+                      onChange={(e) => updateSiteForm({ ...siteForm, host: e.target.value })}
                       className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                         isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                       }`}
@@ -370,7 +449,7 @@ export default function SiteManagerModal({
                     <input
                       type="text"
                       value={siteForm.port}
-                      onChange={(e) => setSiteForm({ ...siteForm, port: e.target.value })}
+                      onChange={(e) => updateSiteForm({ ...siteForm, port: e.target.value })}
                       className={`w-full rounded border px-3 py-1.5 text-center focus:outline-none transition ${
                         isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                       }`}
@@ -386,7 +465,7 @@ export default function SiteManagerModal({
                         type="radio"
                         name="auth"
                         checked={siteForm.authType === "password"}
-                        onChange={() => setSiteForm({ ...siteForm, authType: "password" })}
+                        onChange={() => updateSiteForm({ ...siteForm, authType: "password" })}
                         className="cursor-pointer"
                       />
                       <span>Mot de passe</span>
@@ -397,7 +476,7 @@ export default function SiteManagerModal({
                           type="radio"
                           name="auth"
                           checked={siteForm.authType === "key"}
-                          onChange={() => setSiteForm({ ...siteForm, authType: "key" })}
+                          onChange={() => updateSiteForm({ ...siteForm, authType: "key" })}
                           className="cursor-pointer"
                         />
                         <span>Clé SSH privée</span>
@@ -412,7 +491,7 @@ export default function SiteManagerModal({
                         type="text"
                         placeholder="root"
                         value={siteForm.username}
-                        onChange={(e) => setSiteForm({ ...siteForm, username: e.target.value })}
+                        onChange={(e) => updateSiteForm({ ...siteForm, username: e.target.value })}
                         className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                           isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                         }`}
@@ -421,11 +500,67 @@ export default function SiteManagerModal({
 
                     {siteForm.authType === "password" ? (
                       <div>
-                        <label className="block text-neutral-400 mb-1">Mot de passe</label>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-neutral-400">
+                            Mot de passe
+                            {siteForm.hasPassword && !clearPassword && !secretsRevealed && (
+                              <span className="ml-2 text-[10px] text-emerald-400">(enregistré dans le coffre)</span>
+                            )}
+                            {clearPassword && (
+                              <span className="ml-2 text-[10px] text-amber-400">(sera effacé à l'enregistrement)</span>
+                            )}
+                          </label>
+                          {siteForm.hasPassword && !secretsRevealed && (
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  if (!selectedSiteId) return;
+                                  try {
+                                    const sec = await getSiteSecretsForEdit(selectedSiteId);
+                                    setPasswordInput(sec.password);
+                                    setPassphraseInput(sec.passphrase);
+                                    setSecretsRevealed(true);
+                                    setClearPassword(false);
+                                    setClearPassphrase(false);
+                                  } catch (err) {
+                                    logMessage(`Erreur lecture coffre : ${err}`);
+                                  }
+                                }}
+                                className="flex items-center gap-1 text-[10px] text-sky-400 hover:text-sky-300 cursor-pointer"
+                              >
+                                <Eye className="h-3 w-3" />
+                                <span>Modifier / Révéler</span>
+                              </button>
+                              {!clearPassword && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPasswordInput("");
+                                    setClearPassword(true);
+                                    setIsDirty(true);
+                                  }}
+                                  className="text-[10px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                                >
+                                  Effacer
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
                         <input
                           type="password"
-                          value={siteForm.password || ""}
-                          onChange={(e) => setSiteForm({ ...siteForm, password: e.target.value })}
+                          placeholder={
+                            siteForm.hasPassword && !clearPassword && !secretsRevealed
+                              ? "•••••••• (laisser vide pour conserver l'actuel)"
+                              : "Saisir un mot de passe"
+                          }
+                          value={passwordInput}
+                          onChange={(e) => {
+                            setPasswordInput(e.target.value);
+                            setIsDirty(true);
+                            if (clearPassword && e.target.value.length > 0) setClearPassword(false);
+                          }}
                           className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                             isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                           }`}
@@ -440,7 +575,7 @@ export default function SiteManagerModal({
                               type="text"
                               placeholder="C:\Users\William\.ssh\id_ed25519"
                               value={siteForm.keyPath || ""}
-                              onChange={(e) => setSiteForm({ ...siteForm, keyPath: e.target.value })}
+                              onChange={(e) => updateSiteForm({ ...siteForm, keyPath: e.target.value })}
                               className={`flex-1 rounded border px-3 py-1.5 font-mono text-[11px] focus:outline-none transition ${
                                 isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                               }`}
@@ -455,7 +590,7 @@ export default function SiteManagerModal({
                                     title: "Sélectionner la clé privée SSH",
                                   });
                                   if (selected && typeof selected === "string") {
-                                    setSiteForm({ ...siteForm, keyPath: selected });
+                                    updateSiteForm({ ...siteForm, keyPath: selected });
                                   }
                                 } catch (err) {
                                   logMessage(`Erreur sélection clé : ${err}`);
@@ -470,11 +605,64 @@ export default function SiteManagerModal({
                           </div>
                         </div>
                         <div>
-                          <label className="block text-neutral-400 mb-1">Passphrase</label>
+                          <div className="flex items-center justify-between mb-1">
+                            <label className="text-neutral-400">
+                              Passphrase
+                              {siteForm.hasPassphrase && !clearPassphrase && !secretsRevealed && (
+                                <span className="ml-2 text-[10px] text-emerald-400">(enregistrée dans le coffre)</span>
+                              )}
+                            </label>
+                            {siteForm.hasPassphrase && !secretsRevealed && (
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    if (!selectedSiteId) return;
+                                    try {
+                                      const sec = await getSiteSecretsForEdit(selectedSiteId);
+                                      setPasswordInput(sec.password);
+                                      setPassphraseInput(sec.passphrase);
+                                      setSecretsRevealed(true);
+                                      setClearPassword(false);
+                                      setClearPassphrase(false);
+                                    } catch (err) {
+                                      logMessage(`Erreur lecture coffre : ${err}`);
+                                    }
+                                  }}
+                                  className="flex items-center gap-1 text-[10px] text-sky-400 hover:text-sky-300 cursor-pointer"
+                                >
+                                  <Eye className="h-3 w-3" />
+                                  <span>Modifier / Révéler</span>
+                                </button>
+                                {!clearPassphrase && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setPassphraseInput("");
+                                      setClearPassphrase(true);
+                                      setIsDirty(true);
+                                    }}
+                                    className="text-[10px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                                  >
+                                    Effacer
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
                           <input
                             type="password"
-                            value={siteForm.passphrase || ""}
-                            onChange={(e) => setSiteForm({ ...siteForm, passphrase: e.target.value })}
+                            placeholder={
+                              siteForm.hasPassphrase && !clearPassphrase && !secretsRevealed
+                                ? "•••••••• (laisser vide pour conserver l'actuelle)"
+                                : "Passphrase optionnelle"
+                            }
+                            value={passphraseInput}
+                            onChange={(e) => {
+                              setPassphraseInput(e.target.value);
+                              setIsDirty(true);
+                              if (clearPassphrase && e.target.value.length > 0) setClearPassphrase(false);
+                            }}
                             className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                               isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                             }`}
@@ -495,15 +683,14 @@ export default function SiteManagerModal({
 
         <div className="flex items-center justify-between border-t border-neutral-500/20 px-4 py-3">
           <button
-            onClick={() => {
-              if (vaultLoadFailed) {
-                logMessage("Sauvegarde bloquée : le coffre initial n'a pas pu être déchiffré (protection anti-écrasement).");
-                return;
-              }
-              if (selectedSiteId) {
-                const updated = sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
-                setSites(updated);
-                logMessage("Profil sauvegardé.");
+            onClick={async () => {
+              try {
+                const saved = await saveCurrentForm();
+                if (saved) {
+                  logMessage("Profil sauvegardé.");
+                }
+              } catch (err) {
+                logMessage(`Erreur sauvegarde profil : ${err}`);
               }
             }}
             className="px-3 py-1.5 rounded border border-neutral-700 text-xs hover:bg-neutral-500/10 cursor-pointer transition active:scale-95"
@@ -512,20 +699,25 @@ export default function SiteManagerModal({
           </button>
           <div className="flex gap-2">
             <button
-              onClick={onClose}
+              onClick={() => {
+                resetSecretInputs();
+                onClose();
+              }}
               className="px-3 py-1.5 rounded border border-neutral-700 text-xs hover:bg-neutral-500/10 cursor-pointer transition"
             >
               Fermer
             </button>
             <button
-              onClick={() => {
-                if (selectedSiteId) {
-                  if (!vaultLoadFailed) {
-                    const updated = sites.map((s) => (s.id === selectedSiteId ? siteForm : s));
-                    setSites(updated);
+              onClick={async () => {
+                if (!selectedSiteId) return;
+                try {
+                  const targetSite = !vaultLoadFailed ? await saveCurrentForm() : siteForm;
+                  if (targetSite) {
+                    onConnect(targetSite);
+                    onClose();
                   }
-                  onConnect(siteForm);
-                  onClose();
+                } catch (err) {
+                  logMessage(`Erreur connexion profil : ${err}`);
                 }
               }}
               className="px-4 py-1.5 rounded bg-sky-600 font-semibold text-xs text-white hover:bg-sky-500 cursor-pointer transition active:scale-95"
@@ -650,6 +842,56 @@ export default function SiteManagerModal({
                   className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 font-semibold text-xs text-white cursor-pointer"
                 >
                   Confirmer
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {pendingSwitchSite && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4">
+            <div
+              className={`w-80 rounded-xl border p-4 shadow-2xl space-y-3 ${
+                isDark
+                  ? "bg-neutral-900 border-neutral-700 text-neutral-200"
+                  : "bg-white border-neutral-300 text-neutral-800"
+              }`}
+            >
+              <h4 className="font-semibold text-xs text-amber-400">
+                Modifications non enregistrées
+              </h4>
+              <p className="text-[11px] text-neutral-400">
+                Le profil actuel contient des modifications non sauvegardées. Voulez-vous les enregistrer avant de changer de serveur ?
+              </p>
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  onClick={() => setPendingSwitchSite(null)}
+                  className="px-2.5 py-1 rounded border border-neutral-700 text-xs text-neutral-400 hover:bg-neutral-500/10 cursor-pointer"
+                >
+                  Annuler
+                </button>
+                <button
+                  onClick={() => {
+                    const next = pendingSwitchSite;
+                    applySwitchSite(next);
+                  }}
+                  className="px-2.5 py-1 rounded border border-rose-500/40 text-xs text-rose-400 hover:bg-rose-500/10 cursor-pointer"
+                >
+                  Ignorer
+                </button>
+                <button
+                  onClick={async () => {
+                    const next = pendingSwitchSite;
+                    try {
+                      await saveCurrentForm();
+                      applySwitchSite(next);
+                    } catch (err) {
+                      logMessage(`Erreur sauvegarde profil : ${err}`);
+                      setPendingSwitchSite(null);
+                    }
+                  }}
+                  className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 font-semibold text-xs text-white cursor-pointer"
+                >
+                  Enregistrer
                 </button>
               </div>
             </div>

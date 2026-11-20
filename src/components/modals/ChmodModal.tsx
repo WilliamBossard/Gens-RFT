@@ -39,11 +39,12 @@ export default function ChmodModal({
   if (!chmodModal) return null;
 
   const handleApply = async () => {
-    const permVal = parseInt(octal, 8);
-    if (isNaN(permVal)) {
-      logMessage("Valeur octale invalide (ex: 755 ou 644).");
+    const trimmed = octal.trim();
+    if (!/^[0-7]{3,4}$/.test(trimmed)) {
+      logMessage("Valeur octale invalide (ex: 755, 644 ou 0755).");
       return;
     }
+    const permVal = parseInt(trimmed, 8);
 
     const targetSessionId = chmodModal.sessionId || activeTabId;
     setApplying(true);

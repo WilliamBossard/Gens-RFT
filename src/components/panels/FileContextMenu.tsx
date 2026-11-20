@@ -23,6 +23,7 @@ import {
   isValidFilenameInput,
   joinLocalPath,
   joinRemotePath,
+  replaceFilenameInLocalPath,
 } from "../../utils/fileHelpers";
 import { EditorModalState } from "../modals/FileEditorModal";
 import { ChmodModalState } from "../modals/ChmodModal";
@@ -39,7 +40,7 @@ interface Props {
   selectedRemotePaths: Set<string>;
   setSelectedRemotePaths: (val: Set<string>) => void;
   onNavigateLocal: (targetPath?: string) => void;
-  onNavigateRemote: (targetPath?: string) => void;
+  onNavigateRemote: (targetPath?: string, targetSessionId?: string) => void;
   onCheckAndEnqueueTransfer: (
     filename: string,
     sourcePath: string,
@@ -106,6 +107,9 @@ export default memo(function FileContextMenu({
           <button
             onClick={() => {
               const isRem = contextMenu.isRemote;
+              const targetSessionId = activeTab.id;
+              const targetRemoteDir = activeTab.remotePath;
+              const targetLocalDir = currentPath;
               onClose();
               onPromptInputModal({
                 title: isRem ? "Nouveau fichier distant" : "Nouveau fichier local",
@@ -119,23 +123,23 @@ export default memo(function FileContextMenu({
                     return;
                   }
                   if (isRem) {
-                    const target = joinRemotePath(activeTab.remotePath, fileName);
+                    const target = joinRemotePath(targetRemoteDir, fileName);
                     try {
                       await invoke("create_remote_file", {
-                        sessionId: activeTab.id,
+                        sessionId: targetSessionId,
                         remotePath: target,
                       });
                       logMessage(`Fichier distant créé : ${target}`);
-                      onNavigateRemote(activeTab.remotePath);
+                      onNavigateRemote(targetRemoteDir, targetSessionId);
                     } catch (err) {
                       logMessage(`Erreur création fichier distant : ${err}`);
                     }
                   } else {
-                    const target = joinLocalPath(currentPath, fileName);
+                    const target = joinLocalPath(targetLocalDir, fileName);
                     try {
                       await invoke("create_local_file", { path: target });
                       logMessage(`Fichier local créé : ${target}`);
-                      onNavigateLocal(currentPath);
+                      onNavigateLocal(targetLocalDir);
                     } catch (err) {
                       logMessage(`Erreur création fichier local : ${err}`);
                     }
@@ -152,6 +156,9 @@ export default memo(function FileContextMenu({
           <button
             onClick={() => {
               const isRem = contextMenu.isRemote;
+              const targetSessionId = activeTab.id;
+              const targetRemoteDir = activeTab.remotePath;
+              const targetLocalDir = currentPath;
               onClose();
               onPromptInputModal({
                 title: isRem ? "Nouveau dossier distant" : "Nouveau dossier local",
@@ -165,23 +172,23 @@ export default memo(function FileContextMenu({
                     return;
                   }
                   if (isRem) {
-                    const target = joinRemotePath(activeTab.remotePath, dirName);
+                    const target = joinRemotePath(targetRemoteDir, dirName);
                     try {
                       await invoke("create_remote_dir", {
-                        sessionId: activeTab.id,
+                        sessionId: targetSessionId,
                         path: target,
                       });
                       logMessage(`MKD ${target}`);
-                      onNavigateRemote(activeTab.remotePath);
+                      onNavigateRemote(targetRemoteDir, targetSessionId);
                     } catch (err) {
                       logMessage(`Erreur création dossier distant : ${err}`);
                     }
                   } else {
-                    const target = joinLocalPath(currentPath, dirName);
+                    const target = joinLocalPath(targetLocalDir, dirName);
                     try {
                       await invoke("create_local_dir", { path: target });
                       logMessage(`Dossier local créé : ${target}`);
-                      onNavigateLocal(currentPath);
+                      onNavigateLocal(targetLocalDir);
                     } catch (err) {
                       logMessage(`Erreur création dossier local : ${err}`);
                     }
@@ -252,13 +259,14 @@ export default memo(function FileContextMenu({
               <button
                 onClick={async () => {
                   const entry = contextMenu.entry!;
+                  const targetSessionId = activeTab.id;
                   onClose();
                   const isExec = isDangerousExecutable(entry.name);
                   const performOpen = async (confirmExec: boolean) => {
                     logMessage(`Téléchargement temporaire et ouverture de "${entry.name}"...`);
                     try {
                       const tempPath = await invoke<string>("open_remote_with_system", {
-                        sessionId: activeTab.id,
+                        sessionId: targetSessionId,
                         remotePath: entry.path,
                         confirmExecutable: confirmExec,
                       });
@@ -306,16 +314,18 @@ export default memo(function FileContextMenu({
               <button
                 onClick={async () => {
                   const entry = contextMenu.entry!;
+                  const targetSessionId = activeTab.id;
+                  const targetRemoteDir = activeTab.remotePath;
                   onClose();
                   logMessage(`Extraction distante de "${entry.name}"...`);
                   try {
                     await invoke("extract_remote", {
-                      sessionId: activeTab.id,
-                      parentDir: activeTab.remotePath,
+                      sessionId: targetSessionId,
+                      parentDir: targetRemoteDir,
                       archiveName: entry.name,
                     });
                     logMessage(`Archive "${entry.name}" extraite.`);
-                    onNavigateRemote(activeTab.remotePath);
+                    onNavigateRemote(targetRemoteDir, targetSessionId);
                   } catch (err) {
                     logMessage(`Échec extraction distante : ${err}`);
                   }
@@ -329,17 +339,19 @@ export default memo(function FileContextMenu({
               <button
                 onClick={async () => {
                   const entry = contextMenu.entry!;
+                  const targetSessionId = activeTab.id;
+                  const targetRemoteDir = activeTab.remotePath;
                   onClose();
                   logMessage(`Compression de "${entry.name}" en tar.gz...`);
                   try {
                     const res = await invoke<string>("compress_remote", {
-                      sessionId: activeTab.id,
-                      parentDir: activeTab.remotePath,
+                      sessionId: targetSessionId,
+                      parentDir: targetRemoteDir,
                       itemName: entry.name,
                       format: "tar.gz",
                     });
                     logMessage(`Archive créée : ${res}`);
-                    onNavigateRemote(activeTab.remotePath);
+                    onNavigateRemote(targetRemoteDir, targetSessionId);
                   } catch (err) {
                     logMessage(`Échec compression distante : ${err}`);
                   }
@@ -379,11 +391,12 @@ export default memo(function FileContextMenu({
             <button
               onClick={async () => {
                 const entry = contextMenu.entry!;
+                const targetSessionId = activeTab.id;
                 onClose();
                 logMessage(`Calcul de la taille pour "${entry.name}"...`);
                 try {
                   const out = await invoke<string>("get_remote_size", {
-                    sessionId: activeTab.id,
+                    sessionId: targetSessionId,
                     remotePath: entry.path,
                   });
                   logMessage(`Taille (${entry.name}) : ${out.trim()}`);
@@ -419,6 +432,8 @@ export default memo(function FileContextMenu({
           <button
             onClick={() => {
               const entry = contextMenu.entry!;
+              const targetSessionId = activeTab.id;
+              const targetRemoteDir = activeTab.remotePath;
               onClose();
               onPromptInputModal({
                 title: "Renommer l'élément distant",
@@ -435,12 +450,12 @@ export default memo(function FileContextMenu({
                   const newPath = joinRemotePath(parent, newName);
                   try {
                     await invoke("rename_remote", {
-                      sessionId: activeTab.id,
+                      sessionId: targetSessionId,
                       oldPath: entry.path,
                       newPath,
                     });
                     logMessage(`Renommé à distance : ${entry.name} -> ${newName}`);
-                    onNavigateRemote(activeTab.remotePath);
+                    onNavigateRemote(targetRemoteDir, targetSessionId);
                   } catch (err) {
                     logMessage(`Erreur renommage distant : ${err}`);
                   }
@@ -460,12 +475,13 @@ export default memo(function FileContextMenu({
             <button
               onClick={async () => {
                 const entry = contextMenu.entry!;
+                const targetLocalDir = currentPath;
                 onClose();
                 logMessage(`Extraction locale de "${entry.name}"...`);
                 try {
                   await invoke("extract_local", { path: entry.path });
                   logMessage(`Archive locale extraite.`);
-                  onNavigateLocal(currentPath);
+                  onNavigateLocal(targetLocalDir);
                 } catch (err) {
                   logMessage(`Erreur extraction locale : ${err}`);
                 }
@@ -479,12 +495,13 @@ export default memo(function FileContextMenu({
             <button
               onClick={async () => {
                 const entry = contextMenu.entry!;
+                const targetLocalDir = currentPath;
                 onClose();
                 logMessage(`Compression locale de "${entry.name}"...`);
                 try {
                   const res = await invoke<string>("compress_local", { path: entry.path, format: "zip" });
                   logMessage(`Archive créée : ${res}`);
-                  onNavigateLocal(currentPath);
+                  onNavigateLocal(targetLocalDir);
                 } catch (err) {
                   logMessage(`Erreur compression locale : ${err}`);
                 }
@@ -523,6 +540,7 @@ export default memo(function FileContextMenu({
           <button
             onClick={() => {
               const entry = contextMenu.entry!;
+              const targetLocalDir = currentPath;
               onClose();
               onPromptInputModal({
                 title: "Renommer l'élément local",
@@ -535,13 +553,11 @@ export default memo(function FileContextMenu({
                     logMessage("Nom local invalide (caractères interdits ou '..').");
                     return;
                   }
-                  const sep = entry.path.includes("/") && !entry.path.includes("\\") ? "/" : "\\";
-                  const parent = entry.path.split(sep).slice(0, -1).join(sep);
-                  const newPath = `${parent}${sep}${newName}`;
+                  const newPath = replaceFilenameInLocalPath(entry.path, newName);
                   try {
                     await invoke("rename_local", { oldPath: entry.path, newPath });
                     logMessage(`Renommé en local : ${entry.name} -> ${newName}`);
-                    onNavigateLocal(currentPath);
+                    onNavigateLocal(targetLocalDir);
                   } catch (err) {
                     logMessage(`Erreur renommage local : ${err}`);
                   }
@@ -564,6 +580,9 @@ export default memo(function FileContextMenu({
             onClick={() => {
               const entry = contextMenu.entry!;
               const isRem = contextMenu.isRemote;
+              const targetSessionId = activeTab.id;
+              const targetRemoteDir = activeTab.remotePath;
+              const targetLocalDir = currentPath;
               const selectedPaths = isRem ? selectedRemotePaths : selectedLocalPaths;
               const currentList = isRem ? activeTab.remoteFiles : files;
 
@@ -586,7 +605,7 @@ export default memo(function FileContextMenu({
                     try {
                       if (isRem) {
                         await invoke("delete_remote", {
-                          sessionId: activeTab.id,
+                          sessionId: targetSessionId,
                           path: it.path,
                           isDir: it.is_dir,
                         });
@@ -601,10 +620,10 @@ export default memo(function FileContextMenu({
                   }
                   if (isRem) {
                     setSelectedRemotePaths(new Set());
-                    onNavigateRemote(activeTab.remotePath);
+                    onNavigateRemote(targetRemoteDir, targetSessionId);
                   } else {
                     setSelectedLocalPaths(new Set());
-                    onNavigateLocal(currentPath);
+                    onNavigateLocal(targetLocalDir);
                   }
                 },
               });

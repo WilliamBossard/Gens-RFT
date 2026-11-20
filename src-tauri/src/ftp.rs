@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
-use std::net::ToSocketAddrs;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,17 +11,25 @@ use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 use tauri::{AppHandle, Emitter};
 use walkdir::WalkDir;
 
+use crate::local::is_symlink_or_reparse;
 use crate::models::{FileEntry, RemoteTextFile, TransferProgress};
 use crate::security::{
-    is_valid_remote_filename, unique_local_child_path, validate_ftp_arg,
+    FtpsCertTrustStatus, check_known_ftps_cert, is_safe_remote_delete_target,
+    is_symlink_or_reparse_path, is_valid_remote_filename, save_known_ftps_cert,
+    sha256_fingerprint_der, unique_local_child_path, validate_ftp_arg,
 };
 use crate::state::FtpSessionConfig;
 
 const FTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const FTP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_EDITOR_BYTES: usize = 5 * 1024 * 1024;
+const MAX_SAVE_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
+    parse_ftp_entry_with_meta(line, target_path).map(|(entry, _)| entry)
+}
+
+fn parse_ftp_entry_with_meta(line: &str, target_path: &str) -> Option<(FileEntry, bool)> {
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed
@@ -37,6 +45,7 @@ pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
     if parts.len() >= 9
         && (trimmed.starts_with('d') || trimmed.starts_with('-') || trimmed.starts_with('l'))
     {
+        let is_symlink = trimmed.starts_with('l');
         let mut is_dir = trimmed.starts_with('d');
         let size = parts[4].parse::<u64>().unwrap_or(0);
 
@@ -64,12 +73,16 @@ pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
             parts[8..].join(" ")
         };
 
-        let name = if let Some((link_name, target)) = raw_name.split_once(" -> ") {
-            let t = target.trim();
-            if t.ends_with('/') || is_dir {
-                is_dir = true;
+        let name = if is_symlink {
+            if let Some((link_name, target)) = raw_name.split_once(" -> ") {
+                let t = target.trim();
+                if t.ends_with('/') {
+                    is_dir = true;
+                }
+                link_name.trim().to_string()
+            } else {
+                raw_name
             }
-            link_name.trim().to_string()
         } else {
             raw_name
         };
@@ -81,28 +94,49 @@ pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
         let permissions = if parts[0].len() >= 10 {
             let mut mode = 0u32;
             let bytes = parts[0].as_bytes();
-            if bytes[1] == b'r' { mode |= 0o400; }
-            if bytes[2] == b'w' { mode |= 0o200; }
-            if bytes[3] == b'x' || bytes[3] == b's' { mode |= 0o100; }
-            if bytes[4] == b'r' { mode |= 0o040; }
-            if bytes[5] == b'w' { mode |= 0o020; }
-            if bytes[6] == b'x' || bytes[6] == b's' { mode |= 0o010; }
-            if bytes[7] == b'r' { mode |= 0o004; }
-            if bytes[8] == b'w' { mode |= 0o002; }
-            if bytes[9] == b'x' || bytes[9] == b't' { mode |= 0o001; }
+            if bytes[1] == b'r' {
+                mode |= 0o400;
+            }
+            if bytes[2] == b'w' {
+                mode |= 0o200;
+            }
+            if bytes[3] == b'x' || bytes[3] == b's' {
+                mode |= 0o100;
+            }
+            if bytes[4] == b'r' {
+                mode |= 0o040;
+            }
+            if bytes[5] == b'w' {
+                mode |= 0o020;
+            }
+            if bytes[6] == b'x' || bytes[6] == b's' {
+                mode |= 0o010;
+            }
+            if bytes[7] == b'r' {
+                mode |= 0o004;
+            }
+            if bytes[8] == b'w' {
+                mode |= 0o002;
+            }
+            if bytes[9] == b'x' || bytes[9] == b't' {
+                mode |= 0o001;
+            }
             Some(mode)
         } else {
             None
         };
 
         let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-        return Some(FileEntry {
-            name,
-            path: full_path,
-            is_dir,
-            size,
-            permissions,
-        });
+        return Some((
+            FileEntry {
+                name,
+                path: full_path,
+                is_dir,
+                size,
+                permissions,
+            },
+            is_symlink,
+        ));
     }
 
     // 2. Format DOS (Windows IIS FTP)
@@ -121,13 +155,16 @@ pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
                 return None;
             }
             let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-            return Some(FileEntry {
-                name,
-                path: full_path,
-                is_dir,
-                size,
-                permissions: None,
-            });
+            return Some((
+                FileEntry {
+                    name,
+                    path: full_path,
+                    is_dir,
+                    size,
+                    permissions: None,
+                },
+                false,
+            ));
         }
     }
 
@@ -143,20 +180,24 @@ pub fn parse_ftp_entry(line: &str, target_path: &str) -> Option<FileEntry> {
         return None;
     }
     let full_path = format!("{}/{}", target_path.trim_end_matches('/'), name);
-    Some(FileEntry {
-        name,
-        path: full_path,
-        is_dir,
-        size: 0,
-        permissions: None,
-    })
+    Some((
+        FileEntry {
+            name,
+            path: full_path,
+            is_dir,
+            size: 0,
+            permissions: None,
+        },
+        false,
+    ))
 }
 
 fn is_safe_ftp_entry_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && !name.contains(['/', '\\', '\0', '\r', '\n'])
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(|c| c < '\x20' || c == '\x7f')
 }
 
 pub fn format_host_port(host: &str, port: u16) -> String {
@@ -167,30 +208,135 @@ pub fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
-pub fn connect_ftp_blocking(
-    protocol: &str,
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    accept_invalid_certs: bool,
-) -> Result<NativeTlsFtpStream, String> {
-    validate_ftp_arg(host)?;
-    validate_ftp_arg(username)?;
+#[derive(Debug)]
+struct PinnedNativeTlsConnector {
+    inner: NativeTlsConnector,
+    expected_fingerprint: String,
+}
 
-    let addr_str = format_host_port(host, port);
-    let sock_addrs: Vec<_> = addr_str
-        .to_socket_addrs()
-        .map_err(|e| format!("Résolution DNS {} échouée: {}", addr_str, e))?
-        .collect();
-    if sock_addrs.is_empty() {
-        return Err(format!("Aucune adresse résolue pour {}", addr_str));
+impl suppaftp::TlsConnector for PinnedNativeTlsConnector {
+    type Stream = <NativeTlsConnector as suppaftp::TlsConnector>::Stream;
+
+    fn connect(&self, domain: &str, stream: TcpStream) -> suppaftp::FtpResult<Self::Stream> {
+        let mut tls = self.inner.connect(domain, stream)?;
+        let inner_tls = suppaftp::TlsStream::mut_ref(&mut tls);
+        let cert = inner_tls
+            .peer_certificate()
+            .map_err(|e| suppaftp::FtpError::SecureError(e.to_string()))?
+            .ok_or_else(|| {
+                suppaftp::FtpError::SecureError(
+                    "Le serveur FTPS n'a présenté aucun certificat".to_string(),
+                )
+            })?;
+        let der = cert
+            .to_der()
+            .map_err(|e| suppaftp::FtpError::SecureError(e.to_string()))?;
+        let actual_fp = sha256_fingerprint_der(&der);
+        if actual_fp != self.expected_fingerprint {
+            return Err(suppaftp::FtpError::SecureError(format!(
+                "FTPS_CERT_CHANGED|{}|{}|Empreinte certificat modifiée lors du handshake TLS",
+                actual_fp, self.expected_fingerprint
+            )));
+        }
+        Ok(tls)
+    }
+}
+
+fn build_pinned_ftps_connector(expected_fp: String) -> Result<PinnedNativeTlsConnector, String> {
+    let raw = TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| format!("Erreur configuration TLS: {}", e))?;
+    Ok(PinnedNativeTlsConnector {
+        inner: NativeTlsConnector::from(raw),
+        expected_fingerprint: expected_fp,
+    })
+}
+
+fn read_ftp_reply_code(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+    let mut line = String::new();
+    for _ in 0..512 {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Erreur lecture bannière FTPS: {}", e))?;
+        if n == 0 {
+            return Err("Connexion FTPS fermée avant réponse serveur".to_string());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 4 && bytes[..3].iter().all(|b| b.is_ascii_digit()) && bytes[3] == b' ' {
+            return Ok(trimmed.to_string());
+        }
+        if bytes.len() == 3 && bytes.iter().all(|b| b.is_ascii_digit()) {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err("Bannière FTPS trop longue ou malformée (> 512 lignes)".to_string())
+}
+
+fn probe_ftps_cert_fingerprint(sock_addrs: &[SocketAddr], host: &str) -> Result<String, String> {
+    let mut tcp_opt = None;
+    for &sock in sock_addrs {
+        if let Ok(s) = TcpStream::connect_timeout(&sock, FTP_CONNECT_TIMEOUT) {
+            tcp_opt = Some(s);
+            break;
+        }
+    }
+    let tcp =
+        tcp_opt.ok_or_else(|| "Connexion TCP impossible lors de l'inspection TLS".to_string())?;
+    let _ = tcp.set_read_timeout(Some(FTP_CONNECT_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(FTP_CONNECT_TIMEOUT));
+
+    let tcp_write = tcp.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(tcp);
+    let banner = read_ftp_reply_code(&mut reader)?;
+    if !banner.starts_with("220") {
+        return Err(format!("Réponse FTPS inattendue: {}", banner));
+    }
+    let mut writer = tcp_write;
+    writer
+        .write_all(b"AUTH TLS\r\n")
+        .map_err(|e| format!("Erreur envoi AUTH TLS: {}", e))?;
+    let auth_resp = read_ftp_reply_code(&mut reader)?;
+    if !auth_resp.starts_with("234") {
+        return Err(format!("Serveur FTPS a refusé AUTH TLS: {}", auth_resp));
     }
 
+    let raw_tcp = reader.into_inner();
+    let probe_connector = TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| format!("Erreur probe TLS: {}", e))?;
+    let tls_stream = probe_connector
+        .connect(host, raw_tcp)
+        .map_err(|e| format!("Échec handshake TLS lors de l'inspection: {}", e))?;
+    let cert_opt = tls_stream
+        .peer_certificate()
+        .map_err(|e| format!("Impossible de lire le certificat serveur FTPS: {}", e))?;
+    let cert =
+        cert_opt.ok_or_else(|| "Le serveur FTPS n'a présenté aucun certificat".to_string())?;
+    let der = cert
+        .to_der()
+        .map_err(|e| format!("Erreur encodage DER certificat FTPS: {}", e))?;
+    Ok(sha256_fingerprint_der(&der))
+}
+
+fn connect_tcp_ftp(
+    protocol: &str,
+    sock_addrs: &[SocketAddr],
+) -> Result<NativeTlsFtpStream, String> {
+    let per_addr_timeout = if sock_addrs.len() > 1 {
+        (FTP_CONNECT_TIMEOUT / (sock_addrs.len().min(3) as u32)).max(Duration::from_secs(4))
+    } else {
+        FTP_CONNECT_TIMEOUT
+    };
     let mut last_err = None;
     let mut stream_opt = None;
-    for sock in sock_addrs {
-        match NativeTlsFtpStream::connect_timeout(sock, FTP_CONNECT_TIMEOUT) {
+    for &sock in sock_addrs {
+        match NativeTlsFtpStream::connect_timeout(sock, per_addr_timeout) {
             Ok(s) => {
                 stream_opt = Some(s);
                 break;
@@ -200,58 +346,155 @@ pub fn connect_ftp_blocking(
             }
         }
     }
+    match stream_opt {
+        Some(s) => Ok(s),
+        None => Err(format!(
+            "Erreur TCP {}: {}",
+            protocol,
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "connexion impossible".into())
+        )),
+    }
+}
 
-    let mut ftp = match stream_opt {
-        Some(s) => s,
-        None => {
-            return Err(format!(
-                "Erreur TCP {}: {}",
-                protocol,
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "connexion impossible".into())
-            ));
-        }
-    };
+pub struct FtpConnectParams<'a> {
+    pub app: Option<&'a AppHandle>,
+    pub protocol: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub accept_invalid_certs: bool,
+    pub trust_ftps_cert: bool,
+    pub expected_ftps_fingerprint: Option<&'a str>,
+}
 
+pub fn connect_ftp_blocking(
+    params: FtpConnectParams<'_>,
+) -> Result<(NativeTlsFtpStream, Option<String>), String> {
+    validate_ftp_arg(params.host)?;
+    validate_ftp_arg(params.username)?;
+
+    let addr_str = format_host_port(params.host, params.port);
+    let sock_addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("Résolution DNS {} échouée: {}", addr_str, e))?
+        .collect();
+    if sock_addrs.is_empty() {
+        return Err(format!("Aucune adresse résolue pour {}", addr_str));
+    }
+
+    let mut ftp = connect_tcp_ftp(params.protocol, &sock_addrs)?;
     let _ = ftp.get_ref().set_read_timeout(Some(FTP_IO_TIMEOUT));
     let _ = ftp.get_ref().set_write_timeout(Some(FTP_IO_TIMEOUT));
 
-    if protocol == "FTPS" {
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(accept_invalid_certs)
-            .build()
-            .map_err(|e| format!("Erreur configuration TLS: {}", e))?;
-        let tls_connector = NativeTlsConnector::from(connector);
-        ftp = ftp.into_secure(tls_connector, host).map_err(|e| {
-            let msg = e.to_string();
-            if !accept_invalid_certs {
-                format!("FTPS_CERT_ERROR|{}", msg)
-            } else {
-                format!("Échec négociation TLS (FTPS): {}", msg)
+    let mut pinned_fp: Option<String> = None;
+
+    if params.protocol == "FTPS" {
+        if params.accept_invalid_certs {
+            let connector = TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .map_err(|e| format!("Erreur configuration TLS: {}", e))?;
+            ftp = ftp
+                .into_secure(NativeTlsConnector::from(connector), params.host)
+                .map_err(|e| format!("Échec négociation TLS (FTPS): {}", e))?;
+        } else if params.app.is_none()
+            && let Some(expected_pin) = params.expected_ftps_fingerprint
+        {
+            let pinned_connector = build_pinned_ftps_connector(expected_pin.to_string())?;
+            ftp = ftp
+                .into_secure(pinned_connector, params.host)
+                .map_err(|e| format!("Échec négociation TLS (FTPS): {}", e))?;
+            pinned_fp = Some(expected_pin.to_string());
+        } else {
+            let strict_connector = TlsConnector::builder()
+                .danger_accept_invalid_certs(false)
+                .build()
+                .map_err(|e| format!("Erreur configuration TLS: {}", e))?;
+            match ftp.into_secure(NativeTlsConnector::from(strict_connector), params.host) {
+                Ok(secured) => {
+                    ftp = secured;
+                }
+                Err(strict_err) => {
+                    let strict_msg = strict_err.to_string();
+                    let fp = probe_ftps_cert_fingerprint(&sock_addrs, params.host).map_err(
+                        |probe_err| format!("FTPS_CERT_ERROR|{} ({})", strict_msg, probe_err),
+                    )?;
+
+                    if let Some(expected_pin) = params.expected_ftps_fingerprint
+                        && expected_pin != fp
+                    {
+                        return Err(format!(
+                            "FTPS_CERT_CHANGED|{}|{}|{}",
+                            fp, expected_pin, strict_msg
+                        ));
+                    }
+
+                    if let Some(app_h) = params.app {
+                        match check_known_ftps_cert(app_h, params.host, params.port, &fp)? {
+                            FtpsCertTrustStatus::Trusted => {
+                                pinned_fp = Some(fp.clone());
+                            }
+                            FtpsCertTrustStatus::Changed { expected } => {
+                                return Err(format!(
+                                    "FTPS_CERT_CHANGED|{}|{}|{}",
+                                    fp, expected, strict_msg
+                                ));
+                            }
+                            FtpsCertTrustStatus::Unknown => {
+                                if params.trust_ftps_cert {
+                                    save_known_ftps_cert(app_h, params.host, params.port, &fp)?;
+                                    pinned_fp = Some(fp.clone());
+                                } else {
+                                    return Err(format!("FTPS_CERT_UNKNOWN|{}|{}", fp, strict_msg));
+                                }
+                            }
+                        }
+                    } else if params.expected_ftps_fingerprint.is_some() {
+                        pinned_fp = Some(fp.clone());
+                    } else {
+                        return Err(format!("FTPS_CERT_UNKNOWN|{}|{}", fp, strict_msg));
+                    }
+
+                    ftp = connect_tcp_ftp(params.protocol, &sock_addrs)?;
+                    let _ = ftp.get_ref().set_read_timeout(Some(FTP_IO_TIMEOUT));
+                    let _ = ftp.get_ref().set_write_timeout(Some(FTP_IO_TIMEOUT));
+                    let pinned_connector = build_pinned_ftps_connector(fp)?;
+                    ftp = ftp
+                        .into_secure(pinned_connector, params.host)
+                        .map_err(|e| format!("Échec négociation TLS (FTPS): {}", e))?;
+                }
             }
-        })?;
+        }
+
         let _ = ftp.get_ref().set_read_timeout(Some(FTP_IO_TIMEOUT));
         let _ = ftp.get_ref().set_write_timeout(Some(FTP_IO_TIMEOUT));
     }
 
-    ftp.login(username, password)
-        .map_err(|e| format!("Auth {} rejetée: {}", protocol, e))?;
+    ftp.login(params.username, params.password)
+        .map_err(|e| format!("Auth {} rejetée: {}", params.protocol, e))?;
     ftp.transfer_type(suppaftp::types::FileType::Binary)
-        .map_err(|e| format!("Erreur activation mode binaire {}: {}", protocol, e))?;
+        .map_err(|e| format!("Erreur activation mode binaire {}: {}", params.protocol, e))?;
 
-    Ok(ftp)
+    Ok((ftp, pinned_fp))
 }
 
 pub fn connect_from_config(cfg: &FtpSessionConfig) -> Result<NativeTlsFtpStream, String> {
-    connect_ftp_blocking(
-        &cfg.protocol,
-        &cfg.host,
-        cfg.port,
-        &cfg.username,
-        &cfg.password,
-        cfg.accept_invalid_certs,
-    )
+    let (stream, _) = connect_ftp_blocking(FtpConnectParams {
+        app: None,
+        protocol: &cfg.protocol,
+        host: &cfg.host,
+        port: cfg.port,
+        username: &cfg.username,
+        password: &cfg.password,
+        accept_invalid_certs: cfg.accept_invalid_certs,
+        trust_ftps_cert: false,
+        expected_ftps_fingerprint: cfg.trusted_cert_fingerprint.as_deref(),
+    })?;
+    Ok(stream)
 }
 
 pub fn list_entries_blocking(
@@ -481,6 +724,9 @@ pub fn upload_item_blocking(
     }
 
     let source = Path::new(local_path);
+    if is_symlink_or_reparse_path(source) {
+        return Err("Refus d'uploader un lien symbolique ou junction local.".to_string());
+    }
     if source.is_dir() {
         let root_remote = format!("{}/{}", remote_dest_dir.trim_end_matches('/'), target_name);
         validate_ftp_arg(&root_remote)?;
@@ -490,12 +736,12 @@ pub fn upload_item_blocking(
         let mut files_to_upload: Vec<(PathBuf, String, u64)> = Vec::new();
         let mut total_folder_bytes: u64 = 0;
 
-        for entry_res in WalkDir::new(local_path) {
+        for entry_res in WalkDir::new(local_path).follow_links(false) {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err("Transfert annulé par l'utilisateur".to_string());
             }
             let entry = entry_res.map_err(|e| format!("Erreur lecture locale: {}", e))?;
-            if entry.file_type().is_symlink() {
+            if is_symlink_or_reparse(&entry.file_type(), entry.path()) {
                 continue;
             }
             let rel = entry
@@ -637,6 +883,9 @@ fn download_single_file_ftp_atomic(
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<u64, String> {
     validate_ftp_arg(req.remote_path)?;
+    if is_symlink_or_reparse_path(req.local_target) {
+        return Err("Refus d'écraser un lien symbolique ou junction local.".to_string());
+    }
     if let Some(parent) = req.local_target.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -736,14 +985,18 @@ pub fn download_item_blocking(
 
             let lines = match ftp.list(Some(&rem_dir)) {
                 Ok(l) => l,
-                Err(e) => ftp.nlst(Some(&rem_dir)).map_err(|_| {
-                    format!("Erreur lecture dossier FTP {}: {}", rem_dir, e)
-                })?,
+                Err(e) => ftp
+                    .nlst(Some(&rem_dir))
+                    .map_err(|_| format!("Erreur lecture dossier FTP {}: {}", rem_dir, e))?,
             };
 
             for line in lines {
-                if let Some(item) = parse_ftp_entry(&line, &rem_dir) {
-                    let sub_loc = unique_local_child_path(&loc_dir, &item.name, &mut used_local_paths);
+                if let Some((item, is_symlink)) = parse_ftp_entry_with_meta(&line, &rem_dir) {
+                    if is_symlink {
+                        continue;
+                    }
+                    let sub_loc =
+                        unique_local_child_path(&loc_dir, &item.name, &mut used_local_paths);
                     if item.is_dir {
                         if visited.insert(item.path.clone()) {
                             fs::create_dir_all(&sub_loc).map_err(|e| {
@@ -888,6 +1141,9 @@ pub fn save_text_blocking(
     remote_path: &str,
     content: String,
 ) -> Result<(), String> {
+    if content.len() > MAX_SAVE_TEXT_BYTES {
+        return Err("Contenu trop volumineux (> 16 Mo) pour la sauvegarde texte.".to_string());
+    }
     validate_ftp_arg(remote_path)?;
     let unique_suffix = unique_nanos_suffix().to_string();
     let temp_path = format!("{}.gens_save_{}", remote_path, unique_suffix);
@@ -901,10 +1157,7 @@ pub fn save_text_blocking(
     atomic_replace_remote_ftp(ftp, &temp_path, remote_path, &unique_suffix)
 }
 
-pub fn remove_dir_recursive_ftp(
-    ftp: &mut NativeTlsFtpStream,
-    path: &str,
-) -> Result<(), String> {
+pub fn remove_dir_recursive_ftp(ftp: &mut NativeTlsFtpStream, path: &str) -> Result<(), String> {
     fn inner(
         ftp: &mut NativeTlsFtpStream,
         path: &str,
@@ -915,8 +1168,8 @@ pub fn remove_dir_recursive_ftp(
             return Err("Profondeur maximale atteinte lors de la suppression FTP".to_string());
         }
         validate_ftp_arg(path)?;
-        if path.trim().is_empty() || path == "/" {
-            return Err("Refus de supprimer la racine du serveur".to_string());
+        if !is_safe_remote_delete_target(path) {
+            return Err("Refus de supprimer la racine ou un dossier système protégé".to_string());
         }
         if !visited.insert(path.to_string()) {
             return Ok(());
@@ -926,13 +1179,12 @@ pub fn remove_dir_recursive_ftp(
             Err(e) => ftp.nlst(Some(path)).map_err(|_| e.to_string())?,
         };
         for line in lines {
-            if let Some(entry) = parse_ftp_entry(&line, path) {
-                if entry.is_dir {
+            if let Some((entry, is_symlink)) = parse_ftp_entry_with_meta(&line, path) {
+                if !is_symlink && entry.is_dir {
                     inner(ftp, &entry.path, visited, depth + 1)?;
                 } else {
-                    ftp.rm(&entry.path).map_err(|e| {
-                        format!("Impossible de supprimer {}: {}", entry.path, e)
-                    })?;
+                    ftp.rm(&entry.path)
+                        .map_err(|e| format!("Impossible de supprimer {}: {}", entry.path, e))?;
                 }
             }
         }

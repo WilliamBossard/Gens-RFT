@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from "react";
 import { SlidersHorizontal, Settings, Server, Unplug, ChevronDown } from "lucide-react";
 import { QuickHistoryItem, TabSession } from "../../types";
+import { parseQuickConnectTarget } from "../../utils/pathAndUrl.ts";
 
 interface Props {
   isDark: boolean;
@@ -71,38 +72,12 @@ export default function QuickConnectBar({
   }, [showQuickHistoryDropdown, setShowQuickHistoryDropdown]);
 
   const handleQuickConnect = () => {
-    let host = quickHost.trim();
-    let port = quickPort.trim();
-    let protocol: "SFTP" | "FTP" | "FTPS" = quickProtocol;
-
-    if (host.toLowerCase().startsWith("ftps://")) {
-      protocol = "FTPS";
-      host = host.substring(7);
-      if (!port || port === "22") port = "21";
-    } else if (host.toLowerCase().startsWith("ftp://")) {
-      protocol = "FTP";
-      host = host.substring(6);
-      if (!port || port === "22") port = "21";
-    } else if (host.toLowerCase().startsWith("sftp://")) {
-      protocol = "SFTP";
-      host = host.substring(7);
-      if (!port || port === "21") port = "22";
-    }
-
-    // Support [ipv6]:port ou host:port (en préservant les adresses IPv6 brutes)
-    const hostPortMatch = host.match(/^(?:\[([a-fA-F0-9:]+)\]|([^:]+)):(\d+)$/);
-    if (hostPortMatch) {
-      host = hostPortMatch[1] || hostPortMatch[2];
-      port = hostPortMatch[3];
-    } else if (host.startsWith("[") && host.endsWith("]")) {
-      host = host.slice(1, -1);
-    }
-
+    const parsed = parseQuickConnectTarget(quickHost, quickPort, quickProtocol, quickUser);
     onConnectRequest(
-      protocol,
-      host,
-      port || (protocol === "FTP" || protocol === "FTPS" ? "21" : "22"),
-      quickUser.trim(),
+      parsed.protocol,
+      parsed.host,
+      parsed.port,
+      parsed.username,
       "password",
       quickPass
     );
@@ -115,6 +90,7 @@ export default function QuickConnectBar({
       }`}
     >
       <div className="flex items-center gap-2">
+        <img src="/logo.png" alt="Gens-RFT" className="h-6 w-6 rounded-md shrink-0 shadow-xs" title="Gens-RFT" />
         <button
           onClick={() => setShowSiteManager(!showSiteManager)}
           className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold shadow-xs transition duration-150 active:scale-95 cursor-pointer ${

@@ -9,7 +9,7 @@ export interface QueueItem {
   destFileName: string;
   direction: "upload" | "download";
   isDir: boolean;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   percent: number;
   speed: string;
   eta: string;
@@ -24,15 +24,41 @@ export interface QueueItem {
 interface TransferStore {
   queue: QueueItem[];
   maxConcurrent: number;
+  scheduleTick: number;
   setMaxConcurrent: (limit: number) => void;
   addToQueue: (item: Omit<QueueItem, "id" | "status" | "percent" | "speed" | "eta" | "lastBytes" | "lastTimestamp">) => void;
+  markManyRunning: (ids: string[]) => void;
   updateProgress: (transferId: string, transferred: number, total: number, percent: number) => void;
+  resetProgress: (transferId: string) => void;
   markStatus: (id: string, status: QueueItem["status"], errorReason?: string) => void;
   clearDone: () => void;
   cancelAll: () => Promise<void>;
   cancelItem: (id: string) => Promise<void>;
+  cancelSessionTransfers: (sessionId: string) => void;
   retryItem: (id: string) => void;
   retryAllFailed: () => void;
+}
+
+const MAX_FINISHED_QUEUE_ITEMS = 500;
+
+function pruneFinishedItems(queue: QueueItem[]): QueueItem[] {
+  let finishedCount = 0;
+  for (const it of queue) {
+    if (it.status !== "queued" && it.status !== "running") {
+      finishedCount++;
+    }
+  }
+  if (finishedCount <= MAX_FINISHED_QUEUE_ITEMS) {
+    return queue;
+  }
+  let toDrop = finishedCount - MAX_FINISHED_QUEUE_ITEMS;
+  return queue.filter((it) => {
+    if (toDrop > 0 && it.status !== "queued" && it.status !== "running") {
+      toDrop--;
+      return false;
+    }
+    return true;
+  });
 }
 
 function generateTransferId(): string {
@@ -44,8 +70,9 @@ function generateTransferId(): string {
 export const useTransferStore = create<TransferStore>((set) => ({
   queue: [],
   maxConcurrent: 2,
+  scheduleTick: 0,
 
-  setMaxConcurrent: (limit) => set({ maxConcurrent: limit }),
+  setMaxConcurrent: (limit) => set((state) => ({ maxConcurrent: limit, scheduleTick: state.scheduleTick + 1 })),
 
   addToQueue: (params) => {
     const newItem: QueueItem = {
@@ -58,7 +85,18 @@ export const useTransferStore = create<TransferStore>((set) => ({
       lastBytes: 0,
       lastTimestamp: Date.now(),
     };
-    set((state) => ({ queue: [...state.queue, newItem] }));
+    set((state) => ({ queue: [...state.queue, newItem], scheduleTick: state.scheduleTick + 1 }));
+  },
+
+  markManyRunning: (ids) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    set((state) => ({
+      queue: state.queue.map((it) =>
+        idSet.has(it.id) && it.status === "queued" ? { ...it, status: "running" } : it
+      ),
+      scheduleTick: state.scheduleTick + 1,
+    }));
   },
 
   updateProgress: (transferId, transferred, total, percent) => {
@@ -118,31 +156,67 @@ export const useTransferStore = create<TransferStore>((set) => ({
     }));
   },
 
-  markStatus: (id, status, errorReason) => {
+  resetProgress: (transferId) => {
+    const now = Date.now();
     set((state) => ({
-      queue: state.queue.map((it) => {
+      queue: state.queue.map((item) =>
+        item.id === transferId
+          ? {
+              ...item,
+              percent: 0,
+              speed: "-- Mo/s",
+              eta: "--",
+              lastBytes: 0,
+              lastTimestamp: now,
+            }
+          : item
+      ),
+    }));
+  },
+
+  markStatus: (id, status, errorReason) => {
+    set((state) => {
+      const updated = state.queue.map((it) => {
         if (it.id !== id) return it;
+        if (it.status === "cancelled" && status !== "cancelled") {
+          return it;
+        }
         const isCancelled =
-          status === "error" &&
-          (it.speed === "Annulé" ||
-            (errorReason && errorReason.toLowerCase().includes("annulé")));
+          status === "cancelled" ||
+          (status === "error" &&
+            (it.speed === "Annulé" ||
+              errorReason === "Transfert annulé par l'utilisateur" ||
+              errorReason === "Relais annulé par l'utilisateur ou session cible déconnectée"));
+        const effectiveStatus: QueueItem["status"] = isCancelled ? "cancelled" : status;
         return {
           ...it,
-          status,
-          errorReason: status === "error" ? errorReason || it.errorReason : undefined,
-          percent: status === "done" ? 100 : it.percent,
+          status: effectiveStatus,
+          errorReason:
+            effectiveStatus === "error" || effectiveStatus === "cancelled"
+              ? errorReason || it.errorReason
+              : undefined,
+          percent: effectiveStatus === "done" ? 100 : it.percent,
           speed:
-            status === "done"
+            effectiveStatus === "done"
               ? "Terminé"
-              : status === "error"
-              ? isCancelled
-                ? "Annulé"
-                : "Échec"
+              : effectiveStatus === "cancelled"
+              ? "Annulé"
+              : effectiveStatus === "error"
+              ? "Échec"
               : it.speed,
-          eta: status === "done" ? "0s" : status === "error" ? "--" : it.eta,
+          eta:
+            effectiveStatus === "done"
+              ? "0s"
+              : effectiveStatus === "error" || effectiveStatus === "cancelled"
+              ? "--"
+              : it.eta,
         };
-      }),
-    }));
+      });
+      return {
+        queue: pruneFinishedItems(updated),
+        scheduleTick: state.scheduleTick + 1,
+      };
+    });
   },
 
   clearDone: () => {
@@ -155,35 +229,74 @@ export const useTransferStore = create<TransferStore>((set) => ({
     set((state) => ({
       queue: state.queue.map((it) =>
         it.status === "queued" || it.status === "running"
-          ? { ...it, status: "error", speed: "Annulé", errorReason: "Annulé par l'utilisateur" }
+          ? {
+              ...it,
+              status: "cancelled",
+              speed: "Annulé",
+              eta: "--",
+              errorReason: "Annulé par l'utilisateur",
+            }
           : it
       ),
+      scheduleTick: state.scheduleTick + 1,
     }));
     await invoke("cancel_current_transfer", { transferId: null }).catch(() => {});
   },
 
   cancelItem: async (id: string) => {
     let wasRunning = false;
+    let isRelay = false;
     set((state) => ({
       queue: state.queue.map((it) => {
         if (it.id === id && (it.status === "queued" || it.status === "running")) {
           if (it.status === "running") {
             wasRunning = true;
           }
-          return { ...it, status: "error", speed: "Annulé", errorReason: "Annulé par l'utilisateur" };
+          if (it.relayToSessionId) {
+            isRelay = true;
+          }
+          return {
+            ...it,
+            status: "cancelled",
+            speed: "Annulé",
+            eta: "--",
+            errorReason: "Annulé par l'utilisateur",
+          };
         }
         return it;
       }),
+      scheduleTick: state.scheduleTick + 1,
     }));
     if (wasRunning) {
       await invoke("cancel_current_transfer", { transferId: id }).catch(() => {});
+      if (isRelay) {
+        await invoke("cancel_current_transfer", { transferId: `${id}_relay` }).catch(() => {});
+      }
     }
+  },
+
+  cancelSessionTransfers: (sessionId: string) => {
+    set((state) => ({
+      queue: state.queue.map((it) =>
+        (it.status === "queued" || it.status === "running") &&
+        (it.sessionId === sessionId || it.relayToSessionId === sessionId)
+          ? {
+              ...it,
+              status: "cancelled",
+              speed: "Annulé",
+              eta: "--",
+              errorReason: "Session déconnectée",
+            }
+          : it
+      ),
+      scheduleTick: state.scheduleTick + 1,
+    }));
   },
 
   retryItem: (id) => {
     set((state) => ({
       queue: state.queue.map((it) =>
-        it.id === id && it.status === "error"
+        it.id === id && (it.status === "error" || it.status === "cancelled")
           ? {
               ...it,
               id: generateTransferId(),
@@ -197,6 +310,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
             }
           : it
       ),
+      scheduleTick: state.scheduleTick + 1,
     }));
   },
 
@@ -217,6 +331,7 @@ export const useTransferStore = create<TransferStore>((set) => ({
             }
           : it
       ),
+      scheduleTick: state.scheduleTick + 1,
     }));
   },
 }));

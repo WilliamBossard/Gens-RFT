@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import SiteManagerModal, { SiteProfile } from "./components/modals/SiteManagerModal";
+import SiteManagerModal, { SiteProfileSummary } from "./components/modals/SiteManagerModal";
 import ChmodModal, { ChmodModalState } from "./components/modals/ChmodModal";
 import ConflictModal, { ConflictModalState } from "./components/modals/ConflictModal";
 import FileEditorModal, { EditorModalState } from "./components/modals/FileEditorModal";
@@ -21,12 +21,14 @@ import RemotePane from "./components/panels/RemotePane";
 import BottomPanel, { TerminalTabInfo } from "./components/panels/BottomPanel";
 import FileContextMenu from "./components/panels/FileContextMenu";
 
-import { loadSitesFromBackendVault, saveSitesToBackendVault } from "./utils/cryptoVault";
+import { loadSitesFromBackendVault } from "./utils/cryptoVault";
+import { parseFtpsCertError, sanitizeWindowsFilename } from "./utils/pathAndUrl.ts";
 import {
   buildCopyFilename,
   isValidFilenameInput,
   joinLocalPath,
   joinRemotePath,
+  replaceFilenameInLocalPath,
 } from "./utils/fileHelpers";
 import { useTransferStore } from "./store/useTransferStore";
 import { useLogStore } from "./store/useLogStore";
@@ -67,6 +69,22 @@ function writeSitePath(siteId: string, patch: Partial<SitePathMemory>) {
     const all = readSitePaths();
     all[siteId] = { ...all[siteId], ...patch };
     localStorage.setItem(SITE_PATHS_KEY, JSON.stringify(all));
+  } catch {}
+}
+
+function pruneDeletedSitePaths(validIds: Set<string>) {
+  try {
+    const all = readSitePaths();
+    let changed = false;
+    for (const id of Object.keys(all)) {
+      if (!validIds.has(id)) {
+        delete all[id];
+        changed = true;
+      }
+    }
+    if (changed) {
+      localStorage.setItem(SITE_PATHS_KEY, JSON.stringify(all));
+    }
   } catch {}
 }
 
@@ -124,8 +142,11 @@ export default function App() {
 
   // Actions Zustand stables (sans souscrire à `queue` pour éviter les re-renders à 10 Hz)
   const addToQueue = useTransferStore((s) => s.addToQueue);
+  const markManyRunning = useTransferStore((s) => s.markManyRunning);
   const updateProgress = useTransferStore((s) => s.updateProgress);
+  const resetProgress = useTransferStore((s) => s.resetProgress);
   const markStatus = useTransferStore((s) => s.markStatus);
+  const cancelSessionTransfers = useTransferStore((s) => s.cancelSessionTransfers);
   const setStoreMaxConcurrent = useTransferStore((s) => s.setMaxConcurrent);
 
   // Sessions / Onglets
@@ -226,8 +247,11 @@ export default function App() {
   const processedLocalFiles = useMemo(() => {
     const query = deferredLocalSearch.toLowerCase();
     return files
-      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
-      .filter((f) => (query ? f.name.toLowerCase().includes(query) : true))
+      .filter((f) => {
+        if (!showHidden && f.name.startsWith(".")) return false;
+        if (query && !f.name.toLowerCase().includes(query)) return false;
+        return true;
+      })
       .sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;
         if (!a.is_dir && b.is_dir) return 1;
@@ -243,8 +267,11 @@ export default function App() {
   const processedRemoteFiles = useMemo(() => {
     const query = deferredRemoteSearch.toLowerCase();
     return activeTab.remoteFiles
-      .filter((f) => (showHidden ? true : !f.name.startsWith(".")))
-      .filter((f) => (query ? f.name.toLowerCase().includes(query) : true))
+      .filter((f) => {
+        if (!showHidden && f.name.startsWith(".")) return false;
+        if (query && !f.name.toLowerCase().includes(query)) return false;
+        return true;
+      })
       .sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;
         if (!a.is_dir && b.is_dir) return 1;
@@ -280,9 +307,10 @@ export default function App() {
   const [localHistoryIndex, setLocalHistoryIndex] = useState<number>(-1);
 
   // Sites
-  const [sites, setSites] = useState<SiteProfile[]>([]);
-  const [isSitesLoaded, setIsSitesLoaded] = useState(false);
+  const [sites, setSites] = useState<SiteProfileSummary[]>([]);
   const [vaultLoadFailed, setVaultLoadFailed] = useState(false);
+  const [vaultReady, setVaultReady] = useState(false);
+  const [treeRefreshKey, setTreeRefreshKey] = useState(0);
 
   // Références toujours à jour
   const tabsRef = useRef(tabs);
@@ -304,6 +332,16 @@ export default function App() {
   useEffect(() => {
     filesRef.current = files;
   }, [files]);
+
+  const selectedLocalPathsRef = useRef(selectedLocalPaths);
+  useEffect(() => {
+    selectedLocalPathsRef.current = selectedLocalPaths;
+  }, [selectedLocalPaths]);
+
+  const selectedRemotePathsRef = useRef(selectedRemotePaths);
+  useEffect(() => {
+    selectedRemotePathsRef.current = selectedRemotePaths;
+  }, [selectedRemotePaths]);
 
   const localHistoryRef = useRef(localHistory);
   useEffect(() => {
@@ -333,15 +371,6 @@ export default function App() {
     conflictQueueRef.current = conflictQueue;
   }, [conflictQueue]);
 
-  const sitesRef = useRef(sites);
-  useEffect(() => {
-    sitesRef.current = sites;
-  }, [sites]);
-  const vaultDirtyRef = useRef(false);
-  const vaultReadyRef = useRef(false);
-  useEffect(() => {
-    vaultReadyRef.current = isSitesLoaded && !vaultLoadFailed;
-  }, [isSitesLoaded, vaultLoadFailed]);
   const connectingTabsRef = useRef<Set<string>>(new Set());
 
   const handleOpenContextMenu = useCallback(
@@ -356,14 +385,13 @@ export default function App() {
     let isCancelled = false;
     const loadSecureSites = async () => {
       try {
-        const loaded = await loadSitesFromBackendVault<SiteProfile>("gens_rft_sites");
+        const loaded = await loadSitesFromBackendVault("gens_rft_sites");
         if (!isCancelled) {
           setSites(loaded);
-          setIsSitesLoaded(true);
+          setVaultReady(true);
         }
       } catch (err) {
         if (!isCancelled) {
-          // Ne pas activer isSitesLoaded pour empêcher tout écrasement du coffre existant
           setVaultLoadFailed(true);
           logMessage(`ALERTE SÉCURITÉ : Impossible de déchiffrer le coffre de sites (${err}). Sauvegarde automatique désactivée pour protéger vos données.`);
         }
@@ -374,6 +402,12 @@ export default function App() {
       isCancelled = true;
     };
   }, [logMessage]);
+
+  useEffect(() => {
+    if (vaultReady && !vaultLoadFailed) {
+      pruneDeletedSitePaths(new Set(sites.map((s) => s.id)));
+    }
+  }, [sites, vaultReady, vaultLoadFailed]);
 
   useEffect(() => {
     setSelectedRemotePaths(new Set());
@@ -390,21 +424,6 @@ export default function App() {
   useEffect(() => {
     setRemotePathInput(activeTab.remotePath);
   }, [activeTab.remotePath]);
-
-  // Sauvegarde chiffrée via DPAPI côté Rust (jamais d'écrasement si le chargement initial a échoué)
-  useEffect(() => {
-    if (!isSitesLoaded || vaultLoadFailed) return;
-    vaultDirtyRef.current = true;
-    const timer = setTimeout(async () => {
-      try {
-        await saveSitesToBackendVault(sites);
-        vaultDirtyRef.current = false;
-      } catch (err) {
-        logMessage(`Alerte sécurité : échec de la sauvegarde du coffre (${err}).`);
-      }
-    }, 500);
-    return () => clearTimeout(timer);
-  }, [sites, isSitesLoaded, vaultLoadFailed, logMessage]);
 
   useEffect(() => {
     localStorage.setItem("gens_rft_opt_remember_local", JSON.stringify(rememberLocalPath));
@@ -472,7 +491,10 @@ export default function App() {
     listen<TransferProgress>("transfer_progress", (event) => {
       if (disposed) return;
       const p = event.payload;
-      updateProgress(p.transfer_id, p.transferred, p.total, p.percent);
+      const baseId = p.transfer_id.endsWith("_relay")
+        ? p.transfer_id.slice(0, -"_relay".length)
+        : p.transfer_id;
+      updateProgress(baseId, p.transferred, p.total, p.percent);
     })
       .then((fn) => {
         if (disposed) fn();
@@ -483,10 +505,19 @@ export default function App() {
     listen<string>("sftp_session_lost", (event) => {
       if (disposed) return;
       const lostId = event.payload;
+      cancelSessionTransfers(lostId);
       setTabs((prev) =>
         prev.map((t) =>
           t.id === lostId && t.isConnected
-            ? { ...t, isConnected: false, title: "Déconnecté" }
+            ? {
+                ...t,
+                isConnected: false,
+                title: "Déconnecté",
+                remoteFiles: [],
+                remotePath: "/",
+                remoteHistory: ["/"],
+                remoteHistoryIndex: 0,
+              }
             : t
         )
       );
@@ -504,7 +535,7 @@ export default function App() {
       unlistenProgress?.();
       unlistenSessionLost?.();
     };
-  }, [updateProgress, logMessage]);
+  }, [updateProgress, cancelSessionTransfers, logMessage]);
 
   // Chargement dossier local (protégé contre les réponses obsolètes)
   const loadLocalDirectory = useCallback(
@@ -525,7 +556,10 @@ export default function App() {
         } else if (!currentPathRef.current) {
           if (result.length > 0) {
             const sep = result[0].path.includes("/") && !result[0].path.includes("\\") ? "/" : "\\";
-            const parent = result[0].path.split(/[\\/]/).slice(0, -1).join(sep);
+            let parent = result[0].path.split(/[\\/]/).slice(0, -1).join(sep);
+            if (/^[a-zA-Z]:$/.test(parent)) {
+              parent += "\\";
+            }
             effectivePath = parent || (sep === "/" ? "/" : "C:\\");
           } else {
             const folders = await invoke<Record<string, string>>("get_system_folders").catch(
@@ -672,7 +706,12 @@ export default function App() {
               : f.name.toLowerCase() === filename.toLowerCase()
           );
         } else {
-          exists = filesRef.current.some((f) => f.name.toLowerCase() === filename.toLowerCase());
+          const sanitizedTargetLower = sanitizeWindowsFilename(filename).toLowerCase();
+          const rawLower = filename.toLowerCase();
+          exists = filesRef.current.some((f) => {
+            const nameLower = f.name.toLowerCase();
+            return nameLower === rawLower || nameLower === sanitizedTargetLower;
+          });
         }
       }
 
@@ -705,6 +744,41 @@ export default function App() {
     [addToQueue]
   );
 
+  const handleDropRemoteToLocal = useCallback(
+    (fallbackEntry: FileEntry, targetLocalDir: string) => {
+      const sel = selectedRemotePathsRef.current;
+      const items =
+        sel.has(fallbackEntry.path) && sel.size > 1
+          ? activeTabRef.current.remoteFiles.filter((f) => sel.has(f.path))
+          : [fallbackEntry];
+      for (const it of items) {
+        checkAndEnqueueTransfer(it.name, it.path, targetLocalDir, "download", it.is_dir);
+      }
+    },
+    [checkAndEnqueueTransfer]
+  );
+
+  const handleDropLocalToRemote = useCallback(
+    (fallbackEntry: FileEntry, targetSessionId: string, targetRemoteDir: string) => {
+      const sel = selectedLocalPathsRef.current;
+      const items =
+        sel.has(fallbackEntry.path) && sel.size > 1
+          ? filesRef.current.filter((f) => sel.has(f.path))
+          : [fallbackEntry];
+      for (const it of items) {
+        checkAndEnqueueTransfer(
+          it.name,
+          it.path,
+          targetRemoteDir,
+          "upload",
+          it.is_dir,
+          targetSessionId
+        );
+      }
+    },
+    [checkAndEnqueueTransfer]
+  );
+
   // Glisser-déposer externe natif Tauri v2
   useEffect(() => {
     let disposed = false;
@@ -726,10 +800,17 @@ export default function App() {
               logMessage("Erreur : Impossible d'envoyer des fichiers, serveur déconnecté.");
               return;
             }
+            const targetTabId = currentTab.id;
+            const targetRemotePath = currentTab.remotePath;
             for (const p of paths) {
-              const name = p.split(/[\\/]/).pop() || "fichier";
+              const cleanP = p.replace(/[\\/]+$/, "");
+              const name = cleanP.split(/[\\/]/).pop() || "fichier";
               const isDir = await invoke<boolean>("is_local_dir", { path: p }).catch(() => false);
-              checkAndEnqueueTransfer(name, p, currentTab.remotePath, "upload", isDir, currentTab.id);
+              if (!tabsRef.current.some((t) => t.id === targetTabId && t.isConnected)) {
+                logMessage("Glisser-déposer interrompu : session cible déconnectée.");
+                return;
+              }
+              checkAndEnqueueTransfer(name, p, targetRemotePath, "upload", isDir, targetTabId);
             }
             logMessage(`Glisser-déposer externe : ${paths.length} élément(s) ajouté(s) à la file.`);
           } else {
@@ -761,7 +842,6 @@ export default function App() {
         const running = useTransferStore
           .getState()
           .queue.filter((item) => item.status === "running").length;
-        const needsVaultFlush = vaultDirtyRef.current && vaultReadyRef.current;
 
         if (running > 0) {
           event.preventDefault();
@@ -769,10 +849,6 @@ export default function App() {
             title: "Transferts en cours",
             message: `Il y a actuellement ${running} transfert(s) en cours d'exécution. Voulez-vous vraiment interrompre les transferts et quitter Gens-RFT ?`,
             onConfirm: async () => {
-              if (vaultDirtyRef.current && vaultReadyRef.current) {
-                await saveSitesToBackendVault(sitesRef.current).catch(() => {});
-                vaultDirtyRef.current = false;
-              }
               await invoke("cancel_current_transfer", { transferId: null }).catch(() => {});
               await Promise.all(
                 tabsRef.current
@@ -782,11 +858,6 @@ export default function App() {
               await getCurrentWindow().destroy();
             },
           });
-        } else if (needsVaultFlush) {
-          event.preventDefault();
-          await saveSitesToBackendVault(sitesRef.current).catch(() => {});
-          vaultDirtyRef.current = false;
-          await getCurrentWindow().destroy();
         }
       })
       .then((fn) => {
@@ -804,131 +875,140 @@ export default function App() {
     };
   }, []);
 
-  // Ordonnanceur de transferts hors-rendu React (zéro re-render sur transfer_progress)
+  // Ordonnanceur de transferts hors-rendu React (sans réentrance synchrone ni re-render sur transfer_progress)
   const inFlightIdsRef = useRef<Set<string>>(new Set());
+  const isSchedulingRef = useRef(false);
 
   const processTransferQueue = useCallback(() => {
-    const state = useTransferStore.getState();
-    const limit = state.maxConcurrent || 2;
-    let runningCount = state.queue.filter((item) => item.status === "running").length;
+    if (isSchedulingRef.current) return;
+    isSchedulingRef.current = true;
+    try {
+      const state = useTransferStore.getState();
+      const limit = state.maxConcurrent || 2;
+      const runningCount = state.queue.filter((item) => item.status === "running").length;
+      const availableSlots = Math.max(0, limit - runningCount);
+      if (availableSlots === 0) return;
 
-    while (runningCount < limit) {
-      const nextItem = useTransferStore
-        .getState()
-        .queue.find((item) => item.status === "queued" && !inFlightIdsRef.current.has(item.id));
-      if (!nextItem) break;
+      const batch = state.queue
+        .filter((item) => item.status === "queued" && !inFlightIdsRef.current.has(item.id))
+        .slice(0, availableSlots);
+      if (batch.length === 0) return;
 
-      inFlightIdsRef.current.add(nextItem.id);
-      markStatus(nextItem.id, "running");
-      runningCount++;
+      for (const item of batch) {
+        inFlightIdsRef.current.add(item.id);
+      }
+      markManyRunning(batch.map((item) => item.id));
 
-      const executeTransfer = async () => {
-        try {
-          if (nextItem.direction === "upload") {
-            const finalUploadName = nextItem.destFileName || nextItem.filename;
-            logMessage(`STOR [${finalUploadName}] -> ${nextItem.destDir}`);
-            await invoke("upload_item", {
-              sessionId: nextItem.sessionId,
-              transferId: nextItem.id,
-              localPath: nextItem.sourcePath,
-              remoteDestDir: nextItem.destDir,
-              destFilename: finalUploadName,
-            });
-            if (
-              activeTabRef.current.id === nextItem.sessionId &&
-              activeTabRef.current.remotePath.replace(/\/+$/, "") ===
-                nextItem.destDir.replace(/\/+$/, "")
-            ) {
-              loadRemoteDirectory(activeTabRef.current.remotePath, nextItem.sessionId, false);
-            }
-          } else {
-            const finalDownloadName = nextItem.destFileName || nextItem.filename;
-            logMessage(`RETR [${finalDownloadName}] -> ${nextItem.destDir}`);
-            const savedLocalName = await invoke<string>("download_item", {
-              sessionId: nextItem.sessionId,
-              transferId: nextItem.id,
-              remotePath: nextItem.sourcePath,
-              localDestDir: nextItem.destDir,
-              destFilename: finalDownloadName,
-              isDir: nextItem.isDir,
-            });
-
-            if (nextItem.relayToSessionId && nextItem.relayDestDir) {
-              const currentItem = useTransferStore
-                .getState()
-                .queue.find((q) => q.id === nextItem.id);
-              if (!currentItem || currentItem.status !== "running") {
-                throw new Error("Relais annulé par l'utilisateur");
-              }
-
-              const finalRelayName = nextItem.destFileName || nextItem.filename;
-              const effectiveLocalName = savedLocalName || finalRelayName;
-              const localRelayFile = joinLocalPath(nextItem.destDir, effectiveLocalName);
-              logMessage(`Relais inter-serveurs : Envoi vers le serveur cible (${finalRelayName})...`);
-              updateProgress(nextItem.id, 0, 100, 0);
+      for (const nextItem of batch) {
+        const executeTransfer = async () => {
+          try {
+            if (nextItem.direction === "upload") {
+              const finalUploadName = nextItem.destFileName || nextItem.filename;
+              logMessage(`STOR [${finalUploadName}] -> ${nextItem.destDir}`);
               await invoke("upload_item", {
-                sessionId: nextItem.relayToSessionId,
+                sessionId: nextItem.sessionId,
                 transferId: nextItem.id,
-                localPath: localRelayFile,
-                remoteDestDir: nextItem.relayDestDir,
-                destFilename: finalRelayName,
+                localPath: nextItem.sourcePath,
+                remoteDestDir: nextItem.destDir,
+                destFilename: finalUploadName,
               });
+              if (
+                activeTabRef.current.id === nextItem.sessionId &&
+                activeTabRef.current.remotePath.replace(/\/+$/, "") ===
+                  nextItem.destDir.replace(/\/+$/, "")
+              ) {
+                loadRemoteDirectory(activeTabRef.current.remotePath, nextItem.sessionId, false);
+              }
+            } else {
+              if (nextItem.relayToSessionId) {
+                await invoke("create_local_dir", { path: nextItem.destDir });
+              }
+              const finalDownloadName = nextItem.destFileName || nextItem.filename;
+              logMessage(`RETR [${finalDownloadName}] -> ${nextItem.destDir}`);
+              const savedLocalName = await invoke<string>("download_item", {
+                sessionId: nextItem.sessionId,
+                transferId: nextItem.id,
+                remotePath: nextItem.sourcePath,
+                localDestDir: nextItem.destDir,
+                destFilename: finalDownloadName,
+                isDir: nextItem.isDir,
+              });
+
+              if (nextItem.relayToSessionId && nextItem.relayDestDir) {
+                const currentItem = useTransferStore
+                  .getState()
+                  .queue.find((q) => q.id === nextItem.id);
+                const targetConnected = tabsRef.current.some(
+                  (t) => t.id === nextItem.relayToSessionId && t.isConnected
+                );
+                if (!currentItem || currentItem.status !== "running" || !targetConnected) {
+                  throw new Error("Relais annulé par l'utilisateur ou session cible déconnectée");
+                }
+
+                const finalRelayName = nextItem.destFileName || nextItem.filename;
+                const effectiveLocalName = savedLocalName || finalRelayName;
+                const localRelayFile = joinLocalPath(nextItem.destDir, effectiveLocalName);
+                logMessage(`Relais inter-serveurs : Envoi vers le serveur cible (${finalRelayName})...`);
+                resetProgress(nextItem.id);
+                await invoke("upload_item", {
+                  sessionId: nextItem.relayToSessionId,
+                  transferId: `${nextItem.id}_relay`,
+                  localPath: localRelayFile,
+                  remoteDestDir: nextItem.relayDestDir,
+                  destFilename: finalRelayName,
+                });
+                try {
+                  await invoke("delete_local", { path: nextItem.destDir, isDir: true });
+                } catch {}
+                if (
+                  activeTabRef.current.id === nextItem.relayToSessionId &&
+                  activeTabRef.current.remotePath.replace(/\/+$/, "") ===
+                    nextItem.relayDestDir.replace(/\/+$/, "")
+                ) {
+                  loadRemoteDirectory(
+                    activeTabRef.current.remotePath,
+                    nextItem.relayToSessionId,
+                    false
+                  );
+                }
+              } else {
+                const normCurrent = currentPathRef.current.replace(/[\\/]+$/, "").toLowerCase();
+                const normDest = nextItem.destDir.replace(/[\\/]+$/, "").toLowerCase();
+                if (normCurrent === normDest) {
+                  loadLocalDirectory(currentPathRef.current, false);
+                }
+              }
+            }
+
+            inFlightIdsRef.current.delete(nextItem.id);
+            markStatus(nextItem.id, "done");
+            logMessage(`226 Transfert terminé : ${nextItem.filename}`);
+          } catch (err) {
+            inFlightIdsRef.current.delete(nextItem.id);
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            markStatus(nextItem.id, "error", errorMsg);
+            logMessage(`550 Échec de transfert (${nextItem.filename}) : ${errorMsg}`);
+            if (nextItem.relayToSessionId && nextItem.destDir) {
               try {
                 await invoke("delete_local", { path: nextItem.destDir, isDir: true });
               } catch {}
-              if (
-                activeTabRef.current.id === nextItem.relayToSessionId &&
-                activeTabRef.current.remotePath.replace(/\/+$/, "") ===
-                  nextItem.relayDestDir.replace(/\/+$/, "")
-              ) {
-                loadRemoteDirectory(
-                  activeTabRef.current.remotePath,
-                  nextItem.relayToSessionId,
-                  false
-                );
-              }
-            } else {
-              const normCurrent = currentPathRef.current.replace(/[\\/]+$/, "").toLowerCase();
-              const normDest = nextItem.destDir.replace(/[\\/]+$/, "").toLowerCase();
-              if (normCurrent === normDest) {
-                loadLocalDirectory(currentPathRef.current, false);
-              }
             }
           }
+        };
 
-          inFlightIdsRef.current.delete(nextItem.id);
-          markStatus(nextItem.id, "done");
-          logMessage(`226 Transfert terminé : ${nextItem.filename}`);
-        } catch (err) {
-          inFlightIdsRef.current.delete(nextItem.id);
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          markStatus(nextItem.id, "error", errorMsg);
-          logMessage(`550 Échec de transfert (${nextItem.filename}) : ${errorMsg}`);
-          if (nextItem.relayToSessionId && nextItem.destDir) {
-            try {
-              await invoke("delete_local", { path: nextItem.destDir, isDir: true });
-            } catch {}
-          }
-        }
-      };
-
-      executeTransfer();
+        void executeTransfer();
+      }
+    } finally {
+      isSchedulingRef.current = false;
     }
-  }, [loadLocalDirectory, loadRemoteDirectory, logMessage, markStatus, updateProgress]);
+  }, [loadLocalDirectory, loadRemoteDirectory, logMessage, markManyRunning, markStatus, resetProgress]);
 
   useEffect(() => {
     processTransferQueue();
-    let prevSig = "";
+    let prevTick = useTransferStore.getState().scheduleTick;
     const unsub = useTransferStore.subscribe((state) => {
-      let queued = 0;
-      let running = 0;
-      for (const it of state.queue) {
-        if (it.status === "queued") queued++;
-        else if (it.status === "running") running++;
-      }
-      const sig = `${queued}:${running}:${state.maxConcurrent}`;
-      if (sig !== prevSig) {
-        prevSig = sig;
+      if (state.scheduleTick !== prevTick) {
+        prevTick = state.scheduleTick;
         processTransferQueue();
       }
     });
@@ -991,6 +1071,7 @@ export default function App() {
 
       if (e.key === "F5") {
         e.preventDefault();
+        setTreeRefreshKey((k) => k + 1);
         loadLocalDirectory(ctx.currentPath);
         if (ctx.activeTab.isConnected) {
           loadRemoteDirectory(ctx.activeTab.remotePath);
@@ -1069,9 +1150,7 @@ export default function App() {
                 logMessage("Nom local invalide (caractères interdits ou '..').");
                 return;
               }
-              const sep = entry.path.includes("/") && !entry.path.includes("\\") ? "/" : "\\";
-              const parent = entry.path.split(sep).slice(0, -1).join(sep);
-              const newPath = `${parent}${sep}${newName}`;
+              const newPath = replaceFilenameInLocalPath(entry.path, newName);
               try {
                 await invoke("rename_local", { oldPath: entry.path, newPath });
                 logMessage(`Renommé en local : ${entry.name} -> ${newName}`);
@@ -1142,48 +1221,54 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [loadLocalDirectory, loadRemoteDirectory, logMessage]);
 
-  const handleLocalHistoryBack = () => {
-    if (localHistoryIndex > 0) {
-      const target = localHistory[localHistoryIndex - 1];
-      setLocalHistoryIndex(localHistoryIndex - 1);
+  const handleLocalHistoryBack = useCallback(() => {
+    const idx = localHistoryIndexRef.current;
+    if (idx > 0) {
+      const target = localHistoryRef.current[idx - 1];
+      setLocalHistoryIndex(idx - 1);
       loadLocalDirectory(target, false);
     }
-  };
+  }, [loadLocalDirectory]);
 
-  const handleLocalHistoryForward = () => {
-    if (localHistoryIndex < localHistory.length - 1) {
-      const target = localHistory[localHistoryIndex + 1];
-      setLocalHistoryIndex(localHistoryIndex + 1);
+  const handleLocalHistoryForward = useCallback(() => {
+    const idx = localHistoryIndexRef.current;
+    const hist = localHistoryRef.current;
+    if (idx < hist.length - 1) {
+      const target = hist[idx + 1];
+      setLocalHistoryIndex(idx + 1);
       loadLocalDirectory(target, false);
     }
-  };
+  }, [loadLocalDirectory]);
 
-  const currentRemoteIndex = activeTab.remoteHistoryIndex ?? 0;
-  const currentRemoteHistory = activeTab.remoteHistory || ["/"];
-
-  const handleRemoteHistoryBack = () => {
-    if (currentRemoteIndex > 0) {
-      const target = currentRemoteHistory[currentRemoteIndex - 1];
+  const handleRemoteHistoryBack = useCallback(() => {
+    const tab = activeTabRef.current;
+    const idx = tab.remoteHistoryIndex ?? 0;
+    const hist = tab.remoteHistory || ["/"];
+    if (idx > 0) {
+      const target = hist[idx - 1];
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === activeTab.id ? { ...t, remoteHistoryIndex: currentRemoteIndex - 1 } : t
+          t.id === tab.id ? { ...t, remoteHistoryIndex: idx - 1 } : t
         )
       );
-      loadRemoteDirectory(target, activeTab.id, false);
+      loadRemoteDirectory(target, tab.id, false);
     }
-  };
+  }, [loadRemoteDirectory]);
 
-  const handleRemoteHistoryForward = () => {
-    if (currentRemoteIndex < currentRemoteHistory.length - 1) {
-      const target = currentRemoteHistory[currentRemoteIndex + 1];
+  const handleRemoteHistoryForward = useCallback(() => {
+    const tab = activeTabRef.current;
+    const idx = tab.remoteHistoryIndex ?? 0;
+    const hist = tab.remoteHistory || ["/"];
+    if (idx < hist.length - 1) {
+      const target = hist[idx + 1];
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === activeTab.id ? { ...t, remoteHistoryIndex: currentRemoteIndex + 1 } : t
+          t.id === tab.id ? { ...t, remoteHistoryIndex: idx + 1 } : t
         )
       );
-      loadRemoteDirectory(target, activeTab.id, false);
+      loadRemoteDirectory(target, tab.id, false);
     }
-  };
+  }, [loadRemoteDirectory]);
 
   // Connexion avec validation port + vérification empreinte SSH & certificat FTPS
   const executeConnect = async (
@@ -1200,7 +1285,10 @@ export default function App() {
     initialRemotePath?: string,
     initialLocalPath?: string,
     acceptInvalidCerts = false,
-    trustHostKey = false
+    trustHostKey = false,
+    expectedHostKeyFingerprint?: string,
+    trustFtpsCert = false,
+    expectedFtpsFingerprint?: string
   ) => {
     const cleanHost = targetHost.trim();
     if (!cleanHost) {
@@ -1235,7 +1323,11 @@ export default function App() {
         password: targetPass || null,
         keyPath: targetKeyPath || null,
         passphrase: targetPassphrase || null,
+        siteId: siteId || null,
         trustHostKey,
+        expectedHostKeyFingerprint: expectedHostKeyFingerprint || null,
+        trustFtpsCert,
+        expectedFtpsFingerprint: expectedFtpsFingerprint || null,
         acceptInvalidCerts,
       });
 
@@ -1262,6 +1354,8 @@ export default function App() {
                 port: String(parsedPort),
                 username: targetUser,
                 siteId,
+                remoteHistory: ["/"],
+                remoteHistoryIndex: 0,
               }
             : t
         )
@@ -1324,7 +1418,8 @@ export default function App() {
               initialRemotePath,
               initialLocalPath,
               acceptInvalidCerts,
-              true
+              true,
+              fingerprint
             );
           },
         });
@@ -1339,6 +1434,52 @@ export default function App() {
         setConfirmModal({
           title: "Alerte sécurité : Clé SSH modifiée",
           message: `La clé d'hôte de ${cleanHost}:${parsedPort} ne correspond plus à celle enregistrée dans known_hosts (${algo} : ${fingerprint}). Cela peut indiquer une attaque Man-in-the-Middle. Si ce changement est légitime, supprimez l'ancienne entrée dans ~/.ssh/known_hosts avant de vous reconnecter.`,
+          infoOnly: true,
+          onConfirm: () => {},
+        });
+        return;
+      }
+
+      const ftpsCertInfo = parseFtpsCertError(errStr);
+      if (ftpsCertInfo?.kind === "unknown") {
+        logMessage(
+          `Certificat FTPS inconnu pour ${cleanHost}:${parsedPort} (${ftpsCertInfo.fingerprint})`
+        );
+        setConfirmModal({
+          title: "Certificat TLS FTPS inconnu",
+          message: `Le certificat TLS de ${cleanHost}:${parsedPort} n'est pas encore enregistré (${ftpsCertInfo.detail}). Empreinte : ${ftpsCertInfo.fingerprint}. Voulez-vous lui faire confiance et l'enregistrer (TOFU) ?`,
+          onConfirm: () => {
+            executeConnect(
+              targetSessionId,
+              protocol,
+              cleanHost,
+              String(parsedPort),
+              targetUser,
+              authType,
+              targetPass,
+              targetKeyPath,
+              targetPassphrase,
+              siteId,
+              initialRemotePath,
+              initialLocalPath,
+              acceptInvalidCerts,
+              trustHostKey,
+              expectedHostKeyFingerprint,
+              true,
+              ftpsCertInfo.fingerprint
+            );
+          },
+        });
+        return;
+      }
+
+      if (ftpsCertInfo?.kind === "changed") {
+        logMessage(
+          `ALERTE SÉCURITÉ : Le certificat FTPS de ${cleanHost}:${parsedPort} a changé ! Reçu : ${ftpsCertInfo.fingerprint} (attendu : ${ftpsCertInfo.expected}). Connexion bloquée.`
+        );
+        setConfirmModal({
+          title: "Alerte sécurité : Certificat FTPS modifié",
+          message: `Le certificat TLS de ${cleanHost}:${parsedPort} ne correspond plus à celui enregistré (attendu : ${ftpsCertInfo.expected}, reçu : ${ftpsCertInfo.fingerprint}). Cela peut indiquer une attaque Man-in-the-Middle. Supprimez l'ancienne entrée dans known_ftps_certs.json si ce renouvellement est légitime.`,
           infoOnly: true,
           onConfirm: () => {},
         });
@@ -1435,6 +1576,7 @@ export default function App() {
   };
 
   const handleDisconnect = async (sessionId: string) => {
+    cancelSessionTransfers(sessionId);
     await invoke("disconnect_server", { sessionId }).catch(() => {});
     setTabs((prev) =>
       prev.map((t) =>
@@ -1445,6 +1587,8 @@ export default function App() {
               title: "Déconnecté",
               remoteFiles: [],
               remotePath: "/",
+              remoteHistory: ["/"],
+              remoteHistoryIndex: 0,
             }
           : t
       )
@@ -1471,6 +1615,7 @@ export default function App() {
       remoteHistory: ["/"],
       remoteHistoryIndex: 0,
     };
+    tabsRef.current = [...tabsRef.current, newTab];
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newId);
     return newId;
@@ -1480,7 +1625,9 @@ export default function App() {
     if (e) e.stopPropagation();
     if (tabs.length === 1) return;
     void handleDisconnect(tabId);
+    remoteNavSeqMapRef.current.delete(tabId);
     const newTabs = tabs.filter((t) => t.id !== tabId);
+    tabsRef.current = newTabs;
     setTabs(newTabs);
     if (activeTabId === tabId) {
       setActiveTabId(newTabs[0].id);
@@ -1546,15 +1693,22 @@ export default function App() {
         onResolve: (action: "overwrite" | "rename" | "skip", applyToAll: boolean) => {
           if (applyToAll) {
             const latestQueue = conflictQueueRef.current;
-            const existingNames = getExistingDestNames(current);
+            const destSets = new Map<string, Set<string>>();
             for (const item of latestQueue) {
               if (action === "skip") {
                 logMessage(`Transfert de "${item.filename}" ignoré.`);
               } else {
+                const destKey = `${item.direction}:${item.relayToSessionId || item.destSessionId}:${item.relayDestDir || item.destDir}`;
+                let existingNames = destSets.get(destKey);
+                if (!existingNames) {
+                  existingNames = getExistingDestNames(item);
+                  destSets.set(destKey, existingNames);
+                }
                 const finalName =
                   action === "rename"
                     ? buildCopyFilename(item.filename, item.isDir, existingNames)
                     : item.filename;
+                existingNames.add(finalName.toLowerCase());
                 addToQueue({
                   sessionId: item.destSessionId,
                   filename: item.filename,
@@ -1616,7 +1770,6 @@ export default function App() {
             ? crypto.randomUUID()
             : `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const transferSubdir = joinLocalPath(tempBase, `relay_${uniqueId}`);
-        await invoke("create_local_dir", { path: transferSubdir });
 
         const targetExists = targetTab.remoteFiles.some((f) =>
           targetTab.protocol === "SFTP"
@@ -1691,6 +1844,17 @@ export default function App() {
     [terminalTabs, activeTab.id]
   );
 
+  const handleCloseContextMenu = useCallback(() => setContextMenu(null), []);
+
+  const splitContainerStyle = useMemo(
+    () =>
+      ({
+        "--local-pane-width": `${localPaneWidth}%`,
+        "--tree-height": `${treeHeight}px`,
+      }) as React.CSSProperties,
+    [localPaneWidth, treeHeight]
+  );
+
   return (
     <div
       className={`flex h-screen w-screen flex-col overflow-hidden font-sans select-none ${
@@ -1744,11 +1908,14 @@ export default function App() {
       />
 
       {/* Main Split-Pane */}
-      <div className="flex flex-1 overflow-hidden relative select-none">
+      <div
+        data-split-container
+        style={splitContainerStyle}
+        className="flex flex-1 overflow-hidden relative select-none"
+      >
         {/* Panneau Local */}
         <LocalPane
           isDark={isDark}
-          localPaneWidth={localPaneWidth}
           currentPath={currentPath}
           files={files}
           processedLocalFiles={processedLocalFiles}
@@ -1765,13 +1932,14 @@ export default function App() {
           localSort={localSort}
           setLocalSort={setLocalSort}
           showTreePanels={showTreePanels}
+          treeRefreshKey={treeRefreshKey}
           treeHeight={treeHeight}
           setTreeHeight={setTreeHeight}
           showHidden={showHidden}
           selectedLocalPaths={selectedLocalPaths}
           setSelectedLocalPaths={setSelectedLocalPaths}
-          selectedRemotePaths={selectedRemotePaths}
-          activeTab={activeTab}
+          isRemoteConnected={activeTab.isConnected}
+          activeRemotePath={activeTab.remotePath}
           draggedItem={draggedItem}
           setDraggedItem={setDraggedItem}
           isOverLocal={isOverLocal}
@@ -1783,6 +1951,7 @@ export default function App() {
           onLocalHistoryBack={handleLocalHistoryBack}
           onLocalHistoryForward={handleLocalHistoryForward}
           onCheckAndEnqueueTransfer={checkAndEnqueueTransfer}
+          onDropRemoteToLocal={handleDropRemoteToLocal}
           onOpenContextMenu={handleOpenContextMenu}
           onPromptInputModal={setInputModal}
           logMessage={logMessage}
@@ -1791,7 +1960,6 @@ export default function App() {
         {/* Panneau Distant */}
         <RemotePane
           isDark={isDark}
-          localPaneWidth={localPaneWidth}
           setLocalPaneWidth={setLocalPaneWidth}
           activeTab={activeTab}
           processedRemoteFiles={processedRemoteFiles}
@@ -1808,13 +1976,12 @@ export default function App() {
           remoteSort={remoteSort}
           setRemoteSort={setRemoteSort}
           showTreePanels={showTreePanels}
+          treeRefreshKey={treeRefreshKey}
           treeHeight={treeHeight}
           setTreeHeight={setTreeHeight}
           showHidden={showHidden}
           selectedRemotePaths={selectedRemotePaths}
           setSelectedRemotePaths={setSelectedRemotePaths}
-          selectedLocalPaths={selectedLocalPaths}
-          files={files}
           currentPath={currentPath}
           draggedItem={draggedItem}
           setDraggedItem={setDraggedItem}
@@ -1827,6 +1994,7 @@ export default function App() {
           onRemoteHistoryBack={handleRemoteHistoryBack}
           onRemoteHistoryForward={handleRemoteHistoryForward}
           onCheckAndEnqueueTransfer={checkAndEnqueueTransfer}
+          onDropLocalToRemote={handleDropLocalToRemote}
           onOpenContextMenu={handleOpenContextMenu}
           onPromptInputModal={setInputModal}
           onPromptConfirmModal={setConfirmModal}
@@ -1852,7 +2020,7 @@ export default function App() {
       <FileContextMenu
         isDark={isDark}
         contextMenu={contextMenu}
-        onClose={() => setContextMenu(null)}
+        onClose={handleCloseContextMenu}
         activeTab={activeTab}
         currentPath={currentPath}
         files={files}
@@ -1905,16 +2073,16 @@ export default function App() {
         onClose={() => setShowSiteManager(false)}
         sites={sites}
         setSites={setSites}
-        onConnect={(site: SiteProfile) => {
+        onConnect={(site: SiteProfileSummary) => {
           handleConnectRequest(
             site.protocol,
             site.host,
             site.port,
             site.username,
             site.authType,
-            site.password,
+            undefined,
             site.keyPath,
-            site.passphrase,
+            undefined,
             site.id,
             site.lastRemotePath,
             site.lastLocalPath,

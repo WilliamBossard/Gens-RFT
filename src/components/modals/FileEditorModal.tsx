@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useDeferredValue } from "react";
 import { FileEdit, Search, Save, X, ChevronLeft, ChevronRight, AlertTriangle } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -52,10 +52,11 @@ export default function FileEditorModal({
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const [showConfirmClose, setShowConfirmClose] = useState(false);
   const [showConfirmLossySave, setShowConfirmLossySave] = useState(false);
-  const [scrollTop, setScrollTop] = useState(0);
+  const [firstVisibleLine, setFirstVisibleLine] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(480);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterInnerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (editorModal) {
@@ -66,7 +67,10 @@ export default function FileEditorModal({
       setShowConfirmClose(false);
       setShowConfirmLossySave(false);
       setSearchQuery("");
-      setScrollTop(0);
+      setFirstVisibleLine(0);
+      if (gutterInnerRef.current) {
+        gutterInnerRef.current.style.transform = "translateY(8px)";
+      }
     }
   }, [editorModal]);
 
@@ -83,6 +87,11 @@ export default function FileEditorModal({
     return () => ro.disconnect();
   }, [editorModal]);
 
+  const lowerContent = useMemo(
+    () => (showSearch && searchQuery ? content.toLowerCase() : ""),
+    [showSearch, searchQuery, content]
+  );
+
   useEffect(() => {
     if (!showSearch || !searchQuery) {
       setSearchMatches([]);
@@ -91,31 +100,33 @@ export default function FileEditorModal({
     }
     const timer = setTimeout(() => {
       const q = searchQuery.toLowerCase();
-      const c = content.toLowerCase();
       const matches: number[] = [];
-      let pos = c.indexOf(q);
+      let pos = lowerContent.indexOf(q);
       while (pos !== -1 && matches.length < 1000) {
         matches.push(pos);
-        pos = c.indexOf(q, pos + 1);
+        pos = lowerContent.indexOf(q, pos + 1);
       }
       setSearchMatches(matches);
       setCurrentMatchIndex(matches.length > 0 ? 0 : -1);
     }, 150);
     return () => clearTimeout(timer);
-  }, [showSearch, searchQuery, content]);
+  }, [showSearch, searchQuery, lowerContent]);
 
-  const totalLines = useMemo(() => countLines(content), [content]);
+  const deferredContent = useDeferredValue(content);
+  const totalLines = useMemo(() => countLines(deferredContent), [deferredContent]);
+  const hasUnsavedChanges = useMemo(
+    () => content !== originalContent,
+    [content, originalContent]
+  );
 
   const { startLine, endLine } = useMemo(() => {
-    const first = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - OVERSCAN_LINES);
+    const first = Math.max(0, firstVisibleLine - OVERSCAN_LINES);
     const visibleCount = Math.ceil(viewportHeight / LINE_HEIGHT) + OVERSCAN_LINES * 2;
     const last = Math.min(totalLines, first + visibleCount);
     return { startLine: first, endLine: last };
-  }, [scrollTop, viewportHeight, totalLines]);
+  }, [firstVisibleLine, viewportHeight, totalLines]);
 
   if (!editorModal) return null;
-
-  const hasUnsavedChanges = content !== originalContent;
 
   const performSave = async () => {
     const targetSessionId = editorModal.sessionId || activeTabId;
@@ -155,6 +166,7 @@ export default function FileEditorModal({
   };
 
   const handleRequestClose = () => {
+    if (saving) return;
     if (hasUnsavedChanges) {
       setShowConfirmClose(true);
     } else {
@@ -263,8 +275,9 @@ export default function FileEditorModal({
               <span>{saving ? "Sauvegarde..." : "Enregistrer"}</span>
             </button>
             <button
+              disabled={saving}
               onClick={handleRequestClose}
-              className="p-1 rounded hover:bg-neutral-500/20 text-neutral-400 hover:text-white cursor-pointer transition"
+              className="p-1 rounded hover:bg-neutral-500/20 text-neutral-400 hover:text-white cursor-pointer transition disabled:opacity-40 disabled:cursor-not-allowed"
               title="Fermer"
             >
               <X className="h-4 w-4" />
@@ -304,7 +317,7 @@ export default function FileEditorModal({
               />
               <span className="text-[11px] text-neutral-400">
                 {searchMatches.length > 0
-                  ? `${currentMatchIndex + 1} / ${searchMatches.length}`
+                  ? `${currentMatchIndex + 1} / ${searchMatches.length}${searchMatches.length === 1000 ? "+" : ""}`
                   : searchQuery
                   ? "0 résultat"
                   : ""}
@@ -348,8 +361,9 @@ export default function FileEditorModal({
         <div className="flex-1 bg-neutral-950 flex overflow-hidden font-mono text-xs relative">
           <div className="w-14 bg-neutral-900/60 text-neutral-600 border-r border-neutral-800/80 select-none overflow-hidden font-mono text-xs relative shrink-0">
             <div
+              ref={gutterInnerRef}
               style={{
-                transform: `translateY(${startLine * LINE_HEIGHT - scrollTop + 8}px)`,
+                transform: `translateY(${startLine * LINE_HEIGHT - (textareaRef.current?.scrollTop ?? 0) + 8}px)`,
               }}
               className="pr-2 text-right"
             >
@@ -366,7 +380,17 @@ export default function FileEditorModal({
             autoFocus
             value={content}
             onChange={(e) => setContent(e.target.value)}
-            onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+            onScroll={(e) => {
+              const st = e.currentTarget.scrollTop;
+              const newFirst = Math.floor(st / LINE_HEIGHT);
+              const nextStart = Math.max(0, newFirst - OVERSCAN_LINES);
+              if (gutterInnerRef.current) {
+                gutterInnerRef.current.style.transform = `translateY(${nextStart * LINE_HEIGHT - st + 8}px)`;
+              }
+              if (Math.abs(newFirst - firstVisibleLine) >= 5) {
+                setFirstVisibleLine(newFirst);
+              }
+            }}
             onKeyDown={async (e) => {
               if (e.ctrlKey && e.key.toLowerCase() === "s") {
                 e.preventDefault();
@@ -377,7 +401,11 @@ export default function FileEditorModal({
                 setShowSearch(true);
               }
               if (e.key === "Escape") {
-                if (showSearch) {
+                if (showConfirmClose) {
+                  setShowConfirmClose(false);
+                } else if (showConfirmLossySave) {
+                  setShowConfirmLossySave(false);
+                } else if (showSearch) {
                   setShowSearch(false);
                 } else {
                   handleRequestClose();

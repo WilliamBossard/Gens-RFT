@@ -17,12 +17,11 @@ import {
   Upload,
 } from "lucide-react";
 import DirectoryTree from "../../DirectoryTree";
-import { FileEntry, SortField, SortOrder, TabSession } from "../../types";
+import { FileEntry, SortField, SortOrder } from "../../types";
 import { getFileBadge, formatFileSize, isValidFilenameInput, joinLocalPath } from "../../utils/fileHelpers";
 
 interface Props {
   isDark: boolean;
-  localPaneWidth: number;
   currentPath: string;
   files: FileEntry[];
   processedLocalFiles: FileEntry[];
@@ -39,13 +38,14 @@ interface Props {
   localSort: { field: SortField; order: SortOrder };
   setLocalSort: React.Dispatch<React.SetStateAction<{ field: SortField; order: SortOrder }>>;
   showTreePanels: boolean;
+  treeRefreshKey?: number;
   treeHeight: number;
   setTreeHeight: React.Dispatch<React.SetStateAction<number>>;
   showHidden: boolean;
   selectedLocalPaths: Set<string>;
   setSelectedLocalPaths: React.Dispatch<React.SetStateAction<Set<string>>>;
-  selectedRemotePaths: Set<string>;
-  activeTab: TabSession;
+  isRemoteConnected: boolean;
+  activeRemotePath: string;
   draggedItem: { entry: FileEntry; from: "local" | "remote"; fromSessionId?: string } | null;
   setDraggedItem: (val: { entry: FileEntry; from: "local" | "remote"; fromSessionId?: string } | null) => void;
   isOverLocal: boolean;
@@ -64,6 +64,7 @@ interface Props {
     isDir: boolean,
     destSessionId?: string
   ) => void;
+  onDropRemoteToLocal: (fallbackEntry: FileEntry, targetLocalDir: string) => void;
   onOpenContextMenu: (e: React.MouseEvent, entry: FileEntry | null, isRemote: boolean) => void;
   onPromptInputModal: (modal: {
     title: string;
@@ -76,7 +77,6 @@ interface Props {
 
 function LocalPaneComponent({
   isDark,
-  localPaneWidth,
   currentPath,
   files,
   processedLocalFiles,
@@ -93,13 +93,14 @@ function LocalPaneComponent({
   localSort,
   setLocalSort,
   showTreePanels,
+  treeRefreshKey,
   treeHeight,
   setTreeHeight,
   showHidden,
   selectedLocalPaths,
   setSelectedLocalPaths,
-  selectedRemotePaths,
-  activeTab,
+  isRemoteConnected,
+  activeRemotePath,
   draggedItem,
   setDraggedItem,
   isOverLocal,
@@ -111,6 +112,7 @@ function LocalPaneComponent({
   onLocalHistoryBack,
   onLocalHistoryForward,
   onCheckAndEnqueueTransfer,
+  onDropRemoteToLocal,
   onOpenContextMenu,
   onPromptInputModal,
   logMessage,
@@ -139,7 +141,7 @@ function LocalPaneComponent({
 
   return (
     <section
-      style={{ width: `${localPaneWidth}%` }}
+      style={{ width: "var(--local-pane-width, 50%)" }}
       onDragOver={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -160,19 +162,7 @@ function LocalPaneComponent({
         e.stopPropagation();
         setIsOverLocal(false);
         if (draggedItem && draggedItem.from === "remote") {
-          const items =
-            selectedRemotePaths.has(draggedItem.entry.path) && selectedRemotePaths.size > 1
-              ? activeTab.remoteFiles.filter((f) => selectedRemotePaths.has(f.path))
-              : [draggedItem.entry];
-          for (const it of items) {
-            onCheckAndEnqueueTransfer(
-              it.name,
-              it.path,
-              currentPath,
-              "download",
-              it.is_dir
-            );
-          }
+          onDropRemoteToLocal(draggedItem.entry, currentPath);
           setDraggedItem(null);
         }
       }}
@@ -330,6 +320,12 @@ function LocalPaneComponent({
                 const parts = currentPath.split("/").filter(Boolean);
                 parts.pop();
                 onNavigateLocal("/" + parts.join("/"));
+              } else if (currentPath.startsWith("\\\\")) {
+                const parts = currentPath.slice(2).split(/[\\/]+/).filter(Boolean);
+                if (parts.length > 2) {
+                  parts.pop();
+                  onNavigateLocal("\\\\" + parts.join("\\"));
+                }
               } else {
                 const parts = currentPath.split(/[\\/]+/).filter(Boolean);
                 parts.pop();
@@ -348,6 +344,7 @@ function LocalPaneComponent({
           </button>
           <button
             onClick={() => {
+              const targetBaseDir = currentPath;
               onPromptInputModal({
                 title: "Nouveau dossier local",
                 label: "Nom du dossier :",
@@ -359,11 +356,11 @@ function LocalPaneComponent({
                     logMessage("Nom de dossier local invalide (caractères interdits ou '..').");
                     return;
                   }
-                  const target = joinLocalPath(currentPath, dirName);
+                  const target = joinLocalPath(targetBaseDir, dirName);
                   try {
                     await invoke("create_local_dir", { path: target });
                     logMessage(`Dossier local créé : ${target}`);
-                    onNavigateLocal(currentPath);
+                    onNavigateLocal(targetBaseDir);
                   } catch (err) {
                     logMessage(`Erreur création dossier local : ${err}`);
                   }
@@ -382,8 +379,8 @@ function LocalPaneComponent({
       {showTreePanels && (
         <>
           <div
-            style={{ height: `${treeHeight}px` }}
-            className={`border-b overflow-y-auto ${
+            style={{ height: "var(--tree-height, 130px)" }}
+            className={`border-b overflow-hidden ${
               isDark ? "border-neutral-800/80 bg-neutral-950/70" : "border-neutral-200 bg-neutral-50"
             }`}
           >
@@ -393,19 +390,28 @@ function LocalPaneComponent({
               currentPath={currentPath}
               subFolders={localSubFolders}
               onNavigate={onNavigateLocal}
+              refreshKey={treeRefreshKey}
             />
           </div>
 
           <div
             onMouseDown={(e) => {
+              const splitContainer = e.currentTarget.closest("[data-split-container]") as HTMLElement | null;
               const startY = e.clientY;
-              const startH = treeHeight;
+              const startH = splitContainer
+                ? parseFloat(getComputedStyle(splitContainer).getPropertyValue("--tree-height")) || treeHeight
+                : treeHeight;
+              let latestH = startH;
               const onMouseMove = (ev: MouseEvent) => {
-                setTreeHeight(Math.max(60, Math.min(300, startH + (ev.clientY - startY))));
+                latestH = Math.max(60, Math.min(300, startH + (ev.clientY - startY)));
+                if (splitContainer) {
+                  splitContainer.style.setProperty("--tree-height", `${latestH}px`);
+                }
               };
               const onMouseUp = () => {
                 window.removeEventListener("mousemove", onMouseMove);
                 window.removeEventListener("mouseup", onMouseUp);
+                setTreeHeight(latestH);
               };
               window.addEventListener("mousemove", onMouseMove);
               window.addEventListener("mouseup", onMouseUp);
@@ -523,11 +529,11 @@ function LocalPaneComponent({
                   if (item.is_dir) {
                     onNavigateLocal(item.path);
                   } else {
-                    if (!activeTab.isConnected) {
+                    if (!isRemoteConnected) {
                       logMessage("Info : Connectez-vous d'abord à un serveur distant pour transférer.");
                       return;
                     }
-                    onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
+                    onCheckAndEnqueueTransfer(item.name, item.path, activeRemotePath, "upload", false);
                   }
                 }}
                 onContextMenu={(e) => {
@@ -563,11 +569,11 @@ function LocalPaneComponent({
                 </div>
 
                 <div className="col-span-1 flex justify-center">
-                  {activeTab.isConnected && !item.is_dir && (
+                  {isRemoteConnected && !item.is_dir && (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        onCheckAndEnqueueTransfer(item.name, item.path, activeTab.remotePath, "upload", false);
+                        onCheckAndEnqueueTransfer(item.name, item.path, activeRemotePath, "upload", false);
                       }}
                       className="opacity-0 group-hover:opacity-100 rounded p-1 text-neutral-400 hover:text-sky-500 cursor-pointer transition active:scale-95"
                       title="Envoyer vers le serveur"

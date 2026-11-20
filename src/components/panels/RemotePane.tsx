@@ -29,7 +29,6 @@ import {
 
 interface Props {
   isDark: boolean;
-  localPaneWidth: number;
   setLocalPaneWidth: (val: number) => void;
   activeTab: TabSession;
   processedRemoteFiles: FileEntry[];
@@ -46,13 +45,12 @@ interface Props {
   remoteSort: { field: SortField; order: SortOrder };
   setRemoteSort: React.Dispatch<React.SetStateAction<{ field: SortField; order: SortOrder }>>;
   showTreePanels: boolean;
+  treeRefreshKey?: number;
   treeHeight: number;
   setTreeHeight: React.Dispatch<React.SetStateAction<number>>;
   showHidden: boolean;
   selectedRemotePaths: Set<string>;
   setSelectedRemotePaths: React.Dispatch<React.SetStateAction<Set<string>>>;
-  selectedLocalPaths: Set<string>;
-  files: FileEntry[];
   currentPath: string;
   draggedItem: { entry: FileEntry; from: "local" | "remote"; fromSessionId?: string } | null;
   setDraggedItem: (val: { entry: FileEntry; from: "local" | "remote"; fromSessionId?: string } | null) => void;
@@ -72,6 +70,7 @@ interface Props {
     isDir: boolean,
     destSessionId?: string
   ) => void;
+  onDropLocalToRemote: (fallbackEntry: FileEntry, targetSessionId: string, targetRemoteDir: string) => void;
   onOpenContextMenu: (e: React.MouseEvent, entry: FileEntry | null, isRemote: boolean) => void;
   onPromptInputModal: (modal: {
     title: string;
@@ -89,7 +88,6 @@ interface Props {
 
 function RemotePaneComponent({
   isDark,
-  localPaneWidth,
   setLocalPaneWidth,
   activeTab,
   processedRemoteFiles,
@@ -106,13 +104,12 @@ function RemotePaneComponent({
   remoteSort,
   setRemoteSort,
   showTreePanels,
+  treeRefreshKey,
   treeHeight,
   setTreeHeight,
   showHidden,
   selectedRemotePaths,
   setSelectedRemotePaths,
-  selectedLocalPaths,
-  files,
   currentPath,
   draggedItem,
   setDraggedItem,
@@ -125,6 +122,7 @@ function RemotePaneComponent({
   onRemoteHistoryBack,
   onRemoteHistoryForward,
   onCheckAndEnqueueTransfer,
+  onDropLocalToRemote,
   onOpenContextMenu,
   onPromptInputModal,
   onPromptConfirmModal,
@@ -137,6 +135,17 @@ function RemotePaneComponent({
   useEffect(() => {
     lastSelectedRemoteIndexRef.current = null;
   }, [activeTab.id, activeTab.remotePath]);
+
+  useEffect(() => {
+    if (!showBookmarksMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (bookmarksRef.current && !bookmarksRef.current.contains(e.target as Node)) {
+        setShowBookmarksMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showBookmarksMenu, setShowBookmarksMenu]);
 
   const remoteSubFolders = useMemo(
     () =>
@@ -161,17 +170,20 @@ function RemotePaneComponent({
       {/* Séparateur Redimensionnable horizontal */}
       <div
         onMouseDown={(e) => {
-          const container = e.currentTarget.parentElement;
+          const container = e.currentTarget.parentElement as HTMLElement | null;
           if (!container) return;
           const containerRect = container.getBoundingClientRect();
+          let latestPercent =
+            parseFloat(getComputedStyle(container).getPropertyValue("--local-pane-width")) || 50;
           const onMouseMove = (ev: MouseEvent) => {
             const relX = ev.clientX - containerRect.left;
-            const newPercent = Math.max(20, Math.min(80, (relX / containerRect.width) * 100));
-            setLocalPaneWidth(newPercent);
+            latestPercent = Math.max(20, Math.min(80, (relX / containerRect.width) * 100));
+            container.style.setProperty("--local-pane-width", `${latestPercent}%`);
           };
           const onMouseUp = () => {
             window.removeEventListener("mousemove", onMouseMove);
             window.removeEventListener("mouseup", onMouseUp);
+            setLocalPaneWidth(latestPercent);
           };
           window.addEventListener("mousemove", onMouseMove);
           window.addEventListener("mouseup", onMouseUp);
@@ -182,7 +194,7 @@ function RemotePaneComponent({
 
       {/* Panneau Distant */}
       <section
-        style={{ width: `${100 - localPaneWidth}%` }}
+        style={{ width: "calc(100% - var(--local-pane-width, 50%))" }}
         onDragOver={(e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -208,19 +220,7 @@ function RemotePaneComponent({
               setDraggedItem(null);
               return;
             }
-            const items =
-              selectedLocalPaths.has(draggedItem.entry.path) && selectedLocalPaths.size > 1
-                ? files.filter((f) => selectedLocalPaths.has(f.path))
-                : [draggedItem.entry];
-            for (const it of items) {
-              onCheckAndEnqueueTransfer(
-                it.name,
-                it.path,
-                activeTab.remotePath,
-                "upload",
-                it.is_dir
-              );
-            }
+            onDropLocalToRemote(draggedItem.entry, activeTab.id, activeTab.remotePath);
             setDraggedItem(null);
           }
         }}
@@ -397,6 +397,8 @@ function RemotePaneComponent({
                 </button>
                 <button
                   onClick={() => {
+                    const targetSessionId = activeTab.id;
+                    const targetRemoteDir = activeTab.remotePath;
                     onPromptInputModal({
                       title: "Nouveau dossier distant",
                       label: "Nom du dossier :",
@@ -408,14 +410,14 @@ function RemotePaneComponent({
                           logMessage("Nom de dossier distant invalide (caractères interdits ou '..').");
                           return;
                         }
-                        const target = joinRemotePath(activeTab.remotePath, dirName);
+                        const target = joinRemotePath(targetRemoteDir, dirName);
                         try {
                           await invoke("create_remote_dir", {
-                            sessionId: activeTab.id,
+                            sessionId: targetSessionId,
                             path: target,
                           });
                           logMessage(`MKD ${target}`);
-                          onNavigateRemote(activeTab.remotePath);
+                          onNavigateRemote(targetRemoteDir, targetSessionId);
                         } catch (err) {
                           logMessage(`550 Échec création dossier distant : ${err}`);
                         }
@@ -436,8 +438,8 @@ function RemotePaneComponent({
         {showTreePanels && (
           <>
             <div
-              style={{ height: `${treeHeight}px` }}
-              className={`border-b overflow-y-auto ${
+              style={{ height: "var(--tree-height, 130px)" }}
+              className={`border-b overflow-hidden ${
                 isDark ? "border-neutral-800/80 bg-neutral-950/70" : "border-neutral-200 bg-neutral-50"
               }`}
             >
@@ -449,6 +451,7 @@ function RemotePaneComponent({
                   currentPath={activeTab.remotePath}
                   subFolders={remoteSubFolders}
                   onNavigate={onNavigateRemote}
+                  refreshKey={treeRefreshKey}
                 />
               ) : (
                 <div className="p-3 text-neutral-500 text-xs">Serveur déconnecté</div>
@@ -457,14 +460,22 @@ function RemotePaneComponent({
 
             <div
               onMouseDown={(e) => {
+                const splitContainer = e.currentTarget.closest("[data-split-container]") as HTMLElement | null;
                 const startY = e.clientY;
-                const startH = treeHeight;
+                const startH = splitContainer
+                  ? parseFloat(getComputedStyle(splitContainer).getPropertyValue("--tree-height")) || treeHeight
+                  : treeHeight;
+                let latestH = startH;
                 const onMouseMove = (ev: MouseEvent) => {
-                  setTreeHeight(Math.max(60, Math.min(300, startH + (ev.clientY - startY))));
+                  latestH = Math.max(60, Math.min(300, startH + (ev.clientY - startY)));
+                  if (splitContainer) {
+                    splitContainer.style.setProperty("--tree-height", `${latestH}px`);
+                  }
                 };
                 const onMouseUp = () => {
                   window.removeEventListener("mousemove", onMouseMove);
                   window.removeEventListener("mouseup", onMouseUp);
+                  setTreeHeight(latestH);
                 };
                 window.addEventListener("mousemove", onMouseMove);
                 window.addEventListener("mouseup", onMouseUp);
@@ -635,11 +646,12 @@ function RemotePaneComponent({
                           <button
                             onClick={async (e) => {
                               e.stopPropagation();
+                              const targetSessionId = activeTab.id;
                               const performOpen = async (confirmExec: boolean) => {
                                 logMessage(`Téléchargement temporaire et ouverture de "${item.name}"...`);
                                 try {
                                   const tempPath = await invoke<string>("open_remote_with_system", {
-                                    sessionId: activeTab.id,
+                                    sessionId: targetSessionId,
                                     remotePath: item.path,
                                     confirmExecutable: confirmExec,
                                   });

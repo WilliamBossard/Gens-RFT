@@ -22,16 +22,17 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-russh = "0.45"
-russh-sftp = "2.4"
-russh-keys = "0.45"
-async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3.0"
 walkdir = "2"
-suppaftp = { version = "6.0", default-features = false, features = ["native-tls"] }
+suppaftp = { version = "13.0", default-features = false, features = ["native-tls"] }
 tauri-plugin-dialog = "2"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 zeroize = { version = "1", features = ["derive"] }
+flate2 = "1"
+crc32fast = "1"
+sha2 = "0.11"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

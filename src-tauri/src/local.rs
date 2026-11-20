@@ -5,27 +5,9 @@ use walkdir::WalkDir;
 
 use crate::models::FileEntry;
 use crate::security::{
-    is_safe_local_delete_target, is_safe_local_path_no_traversal, is_valid_local_filename,
+    ensure_safe_local_browse_path, ensure_safe_local_path, is_safe_local_delete_target,
+    is_symlink_or_reparse_path, is_valid_local_filename,
 };
-
-fn ensure_safe_local_path(path: &str) -> Result<(), String> {
-    if path.trim().is_empty() || path.contains('\0') {
-        return Err("Chemin local invalide".to_string());
-    }
-    if !is_safe_local_path_no_traversal(Path::new(path)) {
-        return Err("Chemin local non autorisé (traversée détectée)".to_string());
-    }
-    Ok(())
-}
-
-fn configure_background_command(cmd: &mut tokio::process::Command) {
-    cmd.stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-}
 
 #[cfg(windows)]
 unsafe extern "system" {
@@ -82,12 +64,16 @@ pub fn get_system_folders() -> HashMap<String, String> {
 
 #[tauri::command]
 pub async fn read_local_dir(path: Option<String>) -> Result<Vec<FileEntry>, String> {
+    if let Some(ref p) = path
+        && !p.trim().is_empty()
+    {
+        ensure_safe_local_browse_path(p)?;
+    }
     tokio::task::spawn_blocking(move || {
         let target_path = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
-            _ => dirs_next().unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            }),
+            _ => dirs_next()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         };
 
         let read_dir = fs::read_dir(&target_path).map_err(|e| e.to_string())?;
@@ -119,6 +105,7 @@ pub async fn read_local_dir(path: Option<String>) -> Result<Vec<FileEntry>, Stri
 
 #[tauri::command]
 pub async fn read_local_subdirs(path: String) -> Result<Vec<String>, String> {
+    ensure_safe_local_browse_path(&path)?;
     tokio::task::spawn_blocking(move || {
         let p = Path::new(&path);
         if !p.is_dir() {
@@ -156,22 +143,26 @@ pub fn rename_local(old_path: String, new_path: String) -> Result<(), String> {
 }
 
 fn make_writable(path: &Path) {
-    if let Ok(metadata) = fs::metadata(path) {
-        let perms = metadata.permissions();
-        if perms.readonly() {
-            #[cfg(windows)]
-            {
-                let mut perms = perms;
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = perms.mode() | 0o200;
-                let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
-            }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || is_symlink_or_reparse_path(path) {
+        return;
+    }
+    let perms = metadata.permissions();
+    if perms.readonly() {
+        #[cfg(windows)]
+        {
+            let mut perms = perms;
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = perms.mode() | 0o200;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
         }
     }
 }
@@ -184,8 +175,21 @@ pub async fn delete_local(path: String, is_dir: bool) -> Result<(), String> {
         if !is_safe_local_delete_target(p) {
             return Err("Refus de supprimer la racine du système ou du volume".to_string());
         }
+        if is_symlink_or_reparse_path(p) {
+            #[cfg(windows)]
+            if is_dir {
+                return fs::remove_dir(p).map_err(|e| e.to_string());
+            }
+            return fs::remove_file(p)
+                .or_else(|_| fs::remove_dir(p))
+                .map_err(|e| e.to_string());
+        }
         if is_dir {
-            for entry in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(p)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
                 make_writable(entry.path());
             }
             make_writable(p);
@@ -237,7 +241,7 @@ pub fn create_local_file(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn is_local_dir(path: String) -> bool {
-    if ensure_safe_local_path(&path).is_err() {
+    if ensure_safe_local_browse_path(&path).is_err() {
         return false;
     }
     Path::new(&path).is_dir()
@@ -261,34 +265,76 @@ pub fn is_safe_archive_entry(entry: &str) -> bool {
     true
 }
 
+pub(crate) fn is_symlink_or_reparse(file_type: &fs::FileType, path: &Path) -> bool {
+    if file_type.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    false
+}
+
+fn unique_archive_path(parent: &Path, base_name: &str, ext: &str) -> PathBuf {
+    let first = parent.join(format!("{}.{}", base_name, ext));
+    if !first.exists() {
+        return first;
+    }
+    let mut counter = 2usize;
+    loop {
+        let candidate = parent.join(format!("{} ({}).{}", base_name, counter, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 #[tauri::command]
 pub async fn compress_local(path: String, format: String) -> Result<String, String> {
     ensure_safe_local_path(&path)?;
-    let p = Path::new(&path);
-    let name = p
-        .file_name()
-        .ok_or("Chemin invalide")?
-        .to_string_lossy()
-        .to_string();
-    let parent = p.parent().unwrap_or(Path::new("."));
-    let is_zip = format.to_lowercase() == "zip";
-    let ext = if is_zip { "zip" } else { "tar.gz" };
-    let archive_path = parent.join(format!("{}.{}", name, ext));
-    let archive_str = archive_path.to_string_lossy().to_string();
+    let fmt_lower = format.to_lowercase();
+    let ext = match fmt_lower.as_str() {
+        "zip" => "zip",
+        "tar.gz" | "tgz" => "tar.gz",
+        _ => return Err("Format d'archive local non supporté".to_string()),
+    };
 
-    let mut cmd = tokio::process::Command::new("tar");
-    configure_background_command(&mut cmd);
-    let output = cmd
-        .current_dir(parent)
-        .args(["-acf", &archive_str, "--", &name])
-        .output()
-        .await
-        .map_err(|e| format!("Erreur exécution tar: {}", e))?;
+    tokio::task::spawn_blocking(move || {
+        let p = Path::new(&path);
+        if is_symlink_or_reparse_path(p) {
+            return Err("Refus de compresser un lien symbolique ou junction.".to_string());
+        }
+        if !p.exists() {
+            return Err("Élément local introuvable.".to_string());
+        }
+        let name = p
+            .file_name()
+            .ok_or("Chemin invalide")?
+            .to_string_lossy()
+            .to_string();
+        let parent = p.parent().unwrap_or(Path::new("."));
+        let archive_path = unique_archive_path(parent, &name, ext);
 
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-    Ok(archive_str)
+        if ext == "zip" {
+            crate::archive::create_zip_archive(p, &archive_path)?;
+        } else {
+            crate::archive::create_tar_gz_archive(p, &archive_path)?;
+        }
+
+        Ok(archive_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 pub fn is_safe_tar_verbose_line(line: &str) -> bool {
@@ -299,27 +345,24 @@ pub fn is_safe_tar_verbose_line(line: &str) -> bool {
     // Dans `tar -tvf`, seul '-' (fichier régulier) ou 'd' (dossier) est autorisé.
     // Rejeter 'l' (symlink), 'h' (hardlink), 'c'/'b'/'p'/'s' (périphériques/FIFO/sockets).
     let first = trimmed.chars().next().unwrap_or('-');
-    if first != '-' && first != 'd' {
-        return false;
-    }
-    if trimmed.contains(" -> ") || trimmed.contains(" link to ") {
-        return false;
-    }
-    true
+    first == '-' || first == 'd'
 }
 
-fn move_dir_contents_safe(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
+pub(crate) fn move_dir_contents_safe(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     let entries = fs::read_dir(src_dir).map_err(|e| format!("Erreur lecture staging: {}", e))?;
     for entry_res in entries {
         let entry = entry_res.map_err(|e| format!("Erreur entrée staging: {}", e))?;
         let file_type = entry
             .file_type()
             .map_err(|e| format!("Erreur type entrée staging: {}", e))?;
-        if file_type.is_symlink() {
-            return Err("Lien symbolique détecté après extraction, opération annulée.".to_string());
+        let src_path = entry.path();
+        if is_symlink_or_reparse(&file_type, &src_path) {
+            return Err(
+                "Lien symbolique ou junction détecté après extraction, opération annulée."
+                    .to_string(),
+            );
         }
         let name = entry.file_name();
-        let src_path = entry.path();
         let dst_path = dst_dir.join(&name);
 
         if file_type.is_dir() {
@@ -333,13 +376,21 @@ fn move_dir_contents_safe(src_dir: &Path, dst_dir: &Path) -> Result<(), String> 
                 move_dir_contents_safe(&src_path, &dst_path)?;
                 let _ = fs::remove_dir(&src_path);
             } else {
-                fs::rename(&src_path, &dst_path)
-                    .map_err(|e| format!("Erreur déplacement dossier {}: {}", dst_path.display(), e))?;
+                fs::rename(&src_path, &dst_path).map_err(|e| {
+                    format!("Erreur déplacement dossier {}: {}", dst_path.display(), e)
+                })?;
             }
         } else {
             if dst_path.exists() {
-                fs::remove_file(&dst_path)
-                    .map_err(|e| format!("Impossible de remplacer {}: {}", dst_path.display(), e))?;
+                if dst_path.is_dir() {
+                    return Err(format!(
+                        "Conflit à l'extraction : {} existe déjà en tant que dossier.",
+                        dst_path.display()
+                    ));
+                }
+                fs::remove_file(&dst_path).map_err(|e| {
+                    format!("Impossible de remplacer {}: {}", dst_path.display(), e)
+                })?;
             }
             fs::rename(&src_path, &dst_path)
                 .map_err(|e| format!("Erreur déplacement fichier {}: {}", dst_path.display(), e))?;
@@ -354,116 +405,48 @@ pub async fn extract_local(path: String) -> Result<String, String> {
     if path.trim() == "-" {
         return Err("Chemin d'archive invalide".to_string());
     }
-    let p = Path::new(&path);
-    if !p.is_file() {
-        return Err("Archive locale introuvable.".to_string());
-    }
-    let parent = p.parent().unwrap_or(Path::new("."));
-    let abs_archive = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-
-    // Pré-vérification anti Zip Slip / Tar Slip avant extraction
-    let mut list_cmd = tokio::process::Command::new("tar");
-    configure_background_command(&mut list_cmd);
-    let list_out = list_cmd
-        .arg("-tf")
-        .arg(&abs_archive)
-        .output()
-        .await
-        .map_err(|e| format!("Erreur inspection archive: {}", e))?;
-
-    if !list_out.status.success() {
-        return Err(format!(
-            "Archive invalide ou illisible: {}",
-            String::from_utf8_lossy(&list_out.stderr)
-        ));
-    }
-
-    let listing = String::from_utf8_lossy(&list_out.stdout);
-    for line in listing.lines() {
-        if !line.trim().is_empty() && !is_safe_archive_entry(line) {
-            return Err(format!(
-                "Archive bloquée pour raisons de sécurité (chemin non sûr détecté : {})",
-                line.trim()
-            ));
-        }
-    }
-
-    // Pré-vérification anti Symlink/Hardlink Slip via `tar -tvf`
-    let mut verbose_cmd = tokio::process::Command::new("tar");
-    configure_background_command(&mut verbose_cmd);
-    let verbose_out = verbose_cmd
-        .arg("-tvf")
-        .arg(&abs_archive)
-        .output()
-        .await
-        .map_err(|e| format!("Erreur inspection détaillée archive: {}", e))?;
-
-    if !verbose_out.status.success() {
-        return Err(format!(
-            "Archive invalide ou illisible: {}",
-            String::from_utf8_lossy(&verbose_out.stderr)
-        ));
-    }
-
-    let verbose_listing = String::from_utf8_lossy(&verbose_out.stdout);
-    for line in verbose_listing.lines() {
-        if !is_safe_tar_verbose_line(line) {
-            return Err(format!(
-                "Archive bloquée pour raisons de sécurité (lien ou fichier spécial détecté : {})",
-                line.trim()
-            ));
-        }
-    }
-
-    // Extraction isolée dans un répertoire staging (mitigation TOCTOU)
-    let unique_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let staging_dir = parent.join(format!(".gens_extract_{}", unique_ts));
-    tokio::fs::create_dir_all(&staging_dir)
-        .await
-        .map_err(|e| format!("Impossible de créer le dossier temporaire d'extraction: {}", e))?;
-
-    let mut extract_cmd = tokio::process::Command::new("tar");
-    configure_background_command(&mut extract_cmd);
-    let output = extract_cmd
-        .current_dir(&staging_dir)
-        .args(["-ax", "-f"])
-        .arg(&abs_archive)
-        .output()
-        .await;
-
-    let staging_clone = staging_dir.clone();
-    let parent_owned = parent.to_path_buf();
-
-    let extract_res: Result<(), String> = match output {
-        Ok(out) if out.status.success() => {
-            tokio::task::spawn_blocking(move || {
-                for entry_res in WalkDir::new(&staging_clone).follow_links(false) {
-                    let entry = entry_res.map_err(|e| format!("Erreur scan staging: {}", e))?;
-                    if entry.file_type().is_symlink() {
-                        return Err("Lien symbolique détecté après extraction, opération bloquée.".to_string());
-                    }
-                }
-                move_dir_contents_safe(&staging_clone, &parent_owned)
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        }
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
-        Err(e) => Err(format!("Erreur exécution tar: {}", e)),
-    };
-
-    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-    extract_res?;
-    Ok("Archive locale extraite".into())
+    tokio::task::spawn_blocking(move || {
+        crate::archive::extract_archive_blocking(Path::new(&path))?;
+        Ok("Archive locale extraite".into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 pub fn pid_temp_root() -> PathBuf {
     std::env::temp_dir()
         .join("Gens-RFT")
         .join(format!("pid_{}", std::process::id()))
+}
+
+pub fn cleanup_stale_temp_workspaces() {
+    let root = std::env::temp_dir().join("Gens-RFT");
+    let current_pid_name = format!("pid_{}", std::process::id());
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let stale_age = std::time::Duration::from_secs(12 * 3600);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("pid_") || name == current_pid_name {
+            continue;
+        }
+        let pid_dead = if cfg!(target_os = "linux") {
+            name.strip_prefix("pid_")
+                .is_some_and(|p| !Path::new("/proc").join(p).exists())
+        } else {
+            false
+        };
+        let is_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > stale_age);
+        if pid_dead || is_old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 #[tauri::command]

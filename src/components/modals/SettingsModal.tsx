@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { Settings, X, Sliders, Folder, Info } from "lucide-react";
 
 interface Props {
@@ -41,6 +42,13 @@ export default function SettingsModal({
   isDark = true,
 }: Props) {
   const [settingsTab, setSettingsTab] = useState<"general" | "panels" | "about">("general");
+  const [appVersion, setAppVersion] = useState("0.1.0");
+
+  useEffect(() => {
+    getVersion()
+      .then((v) => setAppVersion(v))
+      .catch(() => {});
+  }, []);
 
   if (!isOpen) return null;
 
@@ -193,6 +201,10 @@ export default function SettingsModal({
                     max="10"
                     value={maxConcurrent}
                     onChange={(e) => setMaxConcurrent(e.target.value)}
+                    onBlur={() => {
+                      const n = Math.max(1, Math.min(10, parseInt(maxConcurrent, 10) || 2));
+                      setMaxConcurrent(String(n));
+                    }}
                     className={`w-full rounded border px-3 py-1.5 focus:outline-none transition ${
                       isDark ? "bg-neutral-950 border-neutral-700 text-neutral-100" : "bg-neutral-50 border-neutral-300 text-neutral-900"
                     }`}
@@ -203,13 +215,16 @@ export default function SettingsModal({
 
             {settingsTab === "about" && (
               <div className="space-y-4">
-                <div>
-                  <h4 className="font-semibold text-neutral-200">Gens-RFT Desktop</h4>
-                  <p className="text-neutral-400 mt-1">Version : 1.0.0 (Release Build)</p>
-                  <p className="text-neutral-500 text-[11px] mt-1">
-                    Client SFTP / FTP / SSH haute performance basé sur Tauri v2 et Rust.
-                  </p>
+                <div className="flex items-center gap-3.5">
+                  <img src="/logo.png" alt="Gens-RFT" className="h-12 w-12 rounded-xl shadow-md shrink-0" />
+                  <div>
+                    <h4 className={`font-semibold ${isDark ? "text-neutral-200" : "text-neutral-900"}`}>Gens-RFT Desktop</h4>
+                    <p className="text-neutral-400 mt-0.5">Version : {appVersion}</p>
+                  </div>
                 </div>
+                <p className="text-neutral-500 text-[11px]">
+                  Client SFTP / FTPS / FTP haute performance avec terminal SSH intégré basé sur Tauri v2 et Rust.
+                </p>
               </div>
             )}
           </div>
